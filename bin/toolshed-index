@@ -6,7 +6,7 @@
 # Usage: toolshed-index [--no-embed]
 #
 # Part of the toolshed catalog toolkit
-# https://github.com/gruncode/toolshed
+# https://github.com/gruncode/toolshed-semantic
 
 set -u
 

@@ -6,7 +6,7 @@
 # Uses fzf + bat/batcat for preview; falls back to select menu if fzf missing
 #
 # Part of the toolshed catalog toolkit
-# https://github.com/gruncode/toolshed
+# https://github.com/gruncode/toolshed-semantic
 
 set -u
 
