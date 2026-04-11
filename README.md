@@ -18,7 +18,7 @@ Unlike snippet managers (navi, pet) that require manual curation, toolshed **sca
 ## Quick start
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/toolshed.git
+git clone https://github.com/gruncode/toolshed.git
 cd toolshed
 ./install.sh
 
