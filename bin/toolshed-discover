@@ -1,0 +1,377 @@
+#!/bin/bash
+# toolshed-discover — find commands you use but haven't cataloged
+# Scans bash history + optionally Claude Code sessions for uncataloged tools
+# Smart "not mine" detection: skips ELF, dpkg/rpm, pip, npm, snap binaries
+#
+# Usage:
+#   toolshed-discover [days]           show uncataloged commands (default: 30 days)
+#   toolshed-discover --ignore CMD     add CMD to permanent ignore list
+#   toolshed-discover --show-ignored   list ignored commands
+#
+# Part of the toolshed catalog toolkit
+# https://github.com/YOUR_USERNAME/toolshed
+
+set -u
+
+TOOLSHED_DIR="${TOOLSHED_DIR:-${HOME}/.local/share/toolshed}"
+TOOLSHED_CONFIG="${TOOLSHED_CONFIG:-${HOME}/.config/toolshed/config}"
+INDEX="$TOOLSHED_DIR/index.tsv"
+IGNORE_FILE="$TOOLSHED_DIR/discover-ignore.txt"
+
+# Load user config
+# shellcheck disable=SC1090
+[ -f "$TOOLSHED_CONFIG" ] && source "$TOOLSHED_CONFIG"
+
+# Handle --ignore and --show-ignored before Python
+case "${1:-}" in
+  --ignore)
+    shift
+    [ -z "${1:-}" ] && { echo "usage: toolshed-discover --ignore CMD [CMD ...]" >&2; exit 1; }
+    touch "$IGNORE_FILE"
+    for cmd in "$@"; do
+      if grep -qxF "$cmd" "$IGNORE_FILE" 2>/dev/null; then
+        echo "already ignored: $cmd"
+      else
+        echo "$cmd" >> "$IGNORE_FILE"
+        echo "ignored: $cmd"
+      fi
+    done
+    exit 0
+    ;;
+  --show-ignored)
+    if [ -f "$IGNORE_FILE" ] && [ -s "$IGNORE_FILE" ]; then
+      echo "Ignored commands ($(wc -l < "$IGNORE_FILE") entries):"
+      cat "$IGNORE_FILE"
+    else
+      echo "No ignored commands."
+    fi
+    exit 0
+    ;;
+  -h|--help)
+    cat <<'EOF'
+toolshed-discover — find commands you use but aren't cataloged
+
+Usage:
+  toolshed-discover [days]           show uncataloged commands (default: 30 days)
+  toolshed-discover --ignore CMD     add CMD to permanent ignore list
+  toolshed-discover --show-ignored   list ignored commands
+  toolshed-discover --help           this help
+
+Ignore file: ~/.local/share/toolshed/discover-ignore.txt
+EOF
+    exit 0
+    ;;
+esac
+
+DAYS="${1:-30}"
+
+if [ ! -f "$INDEX" ]; then
+  echo "toolshed catalog not found — run toolshed-index first" >&2
+  exit 1
+fi
+
+# Build list of history files to scan
+HIST_FILES="${HOME}/.bash_history"
+[ -n "${TOOLSHED_EXTRA_HISTORY:-}" ] && HIST_FILES="$HIST_FILES $TOOLSHED_EXTRA_HISTORY"
+
+# Claude sessions dir (optional)
+SESSIONS_DIR="${TOOLSHED_CLAUDE_SESSIONS:-}"
+
+exec python3 - "$INDEX" "$DAYS" "$IGNORE_FILE" "$HIST_FILES" "$SESSIONS_DIR" << 'PYEOF'
+import os, sys, re, subprocess
+from collections import Counter
+
+INDEX = sys.argv[1]
+DAYS = int(sys.argv[2])
+IGNORE_FILE = sys.argv[3]
+HIST_FILES = sys.argv[4].split()
+SESSIONS_DIR = sys.argv[5] if len(sys.argv) > 5 else ""
+
+# ── 1. Load known commands from toolshed index ──
+known = set()
+known_mcp = set()
+with open(INDEX) as f:
+    next(f)
+    for line in f:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 2:
+            known.add(parts[1])
+            if parts[0] == "mcp-tool":
+                known_mcp.add("mcp__" + parts[1].replace("/", "__"))
+
+# ── 1b. Load user ignore list ──
+ignored = set()
+if os.path.isfile(IGNORE_FILE):
+    with open(IGNORE_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                ignored.add(line)
+
+# ── 2. Builtins & noise to skip ──
+SKIP = {
+    "cd", "ls", "cat", "echo", "test", "true", "false", "pwd", "exit", "return",
+    "source", "export", "set", "unset", "if", "then", "else", "fi", "for",
+    "while", "do", "done", "case", "esac", "in", "function", "local",
+    "readonly", "declare", "typeset", "let", "eval", "exec", "shift", "trap",
+    "wait", "read", "printf", "[", "[[", "{", "}", "(", ")",
+    "sudo", "su", "bash", "sh", "zsh", "python", "python3", "pip", "pip3",
+    "node", "npm", "npx", "git", "docker", "docker-compose", "man", "which",
+    "type", "file", "stat", "chmod", "chown", "mkdir", "cp", "mv", "ln",
+    "touch", "rm", "rmdir", "head", "tail", "less", "more", "wc", "sort",
+    "uniq", "cut", "tr", "sed", "awk", "grep", "egrep", "fgrep", "rg",
+    "find", "xargs", "tee", "date", "sleep", "kill", "killall",
+    "apt", "apt-get", "dpkg", "systemctl", "journalctl", "mount", "umount",
+    "df", "du", "free", "top", "htop", "ssh", "scp", "rsync", "curl", "wget",
+    "tar", "gzip", "gunzip", "zip", "unzip", "jq", "vim", "nano", "vi",
+    "xdg-open", "nohup", "screen", "tmux", "fg", "bg", "jobs", "history", "fc",
+    "ll", "la", "dir", "cls", "clear", "reset", "uname", "hostname", "whoami",
+    "id", "groups", "env", "pushd", "popd", "dirs", "shopt", "bind",
+    "complete", "compgen", "enable", "help", "hash", "command", "builtin",
+    "caller", "coproc", "disown", "logout", "mapfile", "readarray", "select",
+    "time", "times", "ulimit", "umask", "alias", "unalias", "getopts",
+    "tac", "rev", "fold", "fmt", "paste", "join", "comm", "diff", "patch",
+    "stty", "mkfifo", "mknod", "chroot", "nice", "renice", "nproc", "lscpu",
+    "lsblk", "lsof", "lspci", "lsusb", "ip", "ss", "netstat", "route",
+    "ping", "traceroute", "dig", "nslookup", "host", "nc", "nmap",
+    "cryptsetup", "openssl", "gpg", "xclip", "xsel", "xdotool", "xprop",
+    "xwininfo", "wmctrl", "xrandr", "fzf", "batcat", "bat",
+    "chgrp", "dd", "mktemp", "realpath", "basename", "dirname", "tput",
+    "strace", "ltrace", "rpm", "yum", "dnf", "pacman",
+}
+SKIP.update(known)
+SKIP.update(ignored)
+
+STRIP_PREFIXES = {"sudo", "env", "nice", "nohup", "time", "strace", "ltrace", "command", "builtin"}
+
+# ── 3. Extract command names from history files ──
+def extract_commands(histfile):
+    counts = Counter()
+    if not os.path.isfile(histfile):
+        return counts
+    try:
+        with open(histfile, errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line or re.match(r"^#\d+$", line):
+                    continue
+                cmd = line
+                while re.match(r"^[A-Za-z_]\w*=\S*\s", cmd):
+                    cmd = cmd.split(None, 1)[1] if " " in cmd else ""
+                if not cmd:
+                    continue
+                words = cmd.split()
+                while words and words[0] in STRIP_PREFIXES:
+                    words.pop(0)
+                if not words:
+                    continue
+                base = os.path.basename(words[0])
+                if not base or base in SKIP:
+                    continue
+                if base.startswith("-") or base.startswith("."):
+                    continue
+                if re.search(r"""[\"'`$(){}]""", base):
+                    continue
+                counts[base] += 1
+    except Exception:
+        pass
+    return counts
+
+print("Scanning histories...", file=sys.stderr, flush=True)
+cmd_counts = Counter()
+for hf in HIST_FILES:
+    cmd_counts += extract_commands(hf)
+
+# ── 4. Filter: resolve path, detect "not mine" ──
+candidates = {cmd: n for cmd, n in cmd_counts.items() if n >= 2}
+
+# 4a. Resolve paths
+resolved = {}
+for cmd in candidates:
+    for d in os.environ.get("PATH", "").split(":"):
+        p = os.path.join(d, cmd)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            resolved[cmd] = os.path.realpath(p)
+            break
+
+# 4b. "Not mine" detection
+not_mine = set()
+
+# Method 1: ELF binaries
+for cmd, rpath in resolved.items():
+    try:
+        with open(rpath, "rb") as f:
+            magic = f.read(4)
+        if magic == b"\x7fELF":
+            not_mine.add(cmd)
+    except (OSError, PermissionError):
+        pass
+
+# Method 2: pip console_scripts
+try:
+    import importlib.metadata
+    pip_scripts = set()
+    for dist in importlib.metadata.distributions():
+        for ep in dist.entry_points:
+            if ep.group == "console_scripts":
+                pip_scripts.add(ep.name)
+    not_mine.update(cmd for cmd in resolved if cmd in pip_scripts)
+except Exception:
+    pass
+
+# Method 3: npm-managed
+for cmd, rpath in resolved.items():
+    if "node_modules" in rpath or "/npm" in rpath or "/.npm" in rpath:
+        not_mine.add(cmd)
+
+# Method 4: package-manager-owned
+SYSTEM_DIRS = {"/usr/bin", "/usr/sbin", "/bin", "/sbin", "/usr/games"}
+for cmd, rpath in resolved.items():
+    if cmd in not_mine:
+        continue
+    parent = os.path.dirname(rpath)
+    if parent in SYSTEM_DIRS:
+        not_mine.add(cmd)
+    elif "/usr/local/" not in rpath:
+        # Try dpkg (Debian/Ubuntu)
+        try:
+            r = subprocess.run(["dpkg", "-S", rpath], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                not_mine.add(cmd)
+                continue
+        except (FileNotFoundError, Exception):
+            pass
+        # Try rpm (RHEL/Fedora)
+        try:
+            r = subprocess.run(["rpm", "-qf", rpath], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                not_mine.add(cmd)
+                continue
+        except (FileNotFoundError, Exception):
+            pass
+
+# Method 5: snap/flatpak
+for cmd, rpath in resolved.items():
+    if "/snap/" in rpath or "/flatpak/" in rpath:
+        not_mine.add(cmd)
+
+# ── 4c. Extract descriptions from script headers ──
+def extract_desc(filepath):
+    try:
+        with open(filepath, errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 20:
+                    break
+                if i == 0 and line.startswith("#!"):
+                    continue
+                stripped = line.strip()
+                if re.match(r"^#\s*[=\-]{3,}", stripped):
+                    continue
+                m = re.match(r"^#\s*(.+)", stripped)
+                if m:
+                    desc = m.group(1).strip()
+                    if desc.startswith("-*-") or desc.startswith("vim:"):
+                        continue
+                    return desc[:80]
+                if stripped and not stripped.startswith("#"):
+                    break
+    except Exception:
+        pass
+    return ""
+
+bash_results = []
+for cmd, count in sorted(candidates.items(), key=lambda x: -x[1]):
+    if cmd not in resolved:
+        continue
+    if cmd in not_mine:
+        continue
+    desc = extract_desc(resolved[cmd])
+    bash_results.append((cmd, count, resolved[cmd], desc))
+
+# ── 5. Scan Claude sessions for MCP tool calls (optional) ──
+mcp_results = []
+if SESSIONS_DIR and os.path.isdir(SESSIONS_DIR):
+    print(f"Scanning Claude sessions (last {DAYS}d)...", file=sys.stderr, flush=True)
+    mcp_counts = Counter()
+    import time
+    cutoff = time.time() - DAYS * 86400
+
+    for fname in os.listdir(SESSIONS_DIR):
+        if not fname.endswith(".jsonl"):
+            continue
+        fpath = os.path.join(SESSIONS_DIR, fname)
+        try:
+            if os.path.getmtime(fpath) < cutoff:
+                continue
+        except OSError:
+            continue
+        try:
+            with open(fpath, errors="replace") as f:
+                for line in f:
+                    if '"mcp__' not in line:
+                        continue
+                    for m in re.finditer(r'"name"\s*:\s*"(mcp__[^"]+)"', line):
+                        tool = m.group(1)
+                        mcp_counts[tool] += 1
+        except Exception:
+            pass
+
+    for tool, count in mcp_counts.most_common():
+        if tool in known_mcp or tool in ignored:
+            continue
+        skip = False
+        for k in known:
+            if tool.endswith("__" + k.replace("/", "__")):
+                skip = True
+                break
+        if skip:
+            continue
+        mcp_results.append((tool, count))
+
+# ── 5b. Make MCP tool names human-readable ──
+def humanize_mcp(name):
+    n = name
+    if n.startswith("mcp__"):
+        n = n[5:]
+    m = re.match(r"claude_ai_([^_]+(?:_[^_]+)*)__(.+)", n)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}", "cloud"
+    m = re.match(r"plugin_[^_]+_([^_]+)__(.+)", n)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}", "plugin"
+    parts = n.split("__", 1)
+    if len(parts) == 2:
+        return f"{parts[0]}/{parts[1]}", "local"
+    return n, "?"
+
+# ── 6. Output ──
+found = 0
+
+if bash_results:
+    print(f"\nCommands used but not in toolshed catalog:")
+    print("─" * 72)
+    for cmd, count, path, desc in bash_results:
+        line = f"  {cmd:<24s} {count:>4}x  {path}"
+        if desc:
+            line += f"\n  {'':24s}       {desc}"
+        print(line)
+        found += 1
+    print()
+
+if mcp_results:
+    print(f"MCP tools used in Claude but not in toolshed (last {DAYS}d):")
+    print("─" * 72)
+    for tool, count in mcp_results:
+        human, kind = humanize_mcp(tool)
+        tag = f" ({kind})" if kind != "local" else ""
+        print(f"  {human:<45s}{tag:>10s} {count:>4}x")
+        found += 1
+    print()
+
+if found == 0:
+    print("\nAll commands and MCP tools you use are already cataloged. ✓")
+else:
+    print(f"Found {found} uncataloged items.")
+    print("To ignore:  toolshed-discover --ignore <name>")
+    print("To catalog: add scripts to a scanned dir, then toolshed-index")
+PYEOF

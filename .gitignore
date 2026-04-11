@@ -1,0 +1,20 @@
+# User data (generated at runtime, not part of the repo)
+*.npz
+index.tsv
+CMDLIST.md
+CHANGELOG.md
+
+# Editor and OS artifacts
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# User config (contains API keys)
+config

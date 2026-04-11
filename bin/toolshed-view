@@ -1,0 +1,56 @@
+#!/bin/bash
+# Opens the full source of a catalog entry in a syntax-highlighted pager
+# Called from toolshed via F3 binding
+# Part of the toolshed catalog toolkit
+
+set -u
+
+TOOLSHED_DIR="${TOOLSHED_DIR:-${HOME}/.local/share/toolshed}"
+INDEX="$TOOLSHED_DIR/index.tsv"
+row="${1:-}"
+[ -z "$row" ] && exit 0
+
+type=$(printf '%s' "$row" | awk '{print $1}' | tr -d '[]')
+name=$(printf '%s' "$row" | awk '{print $2}')
+rec=$(awk -F'\t' -v t="$type" -v n="$name" '$1==t && $2==n {print; exit}' "$INDEX")
+if [ -z "$rec" ]; then
+  echo "(no record for $type/$name)"
+  read -rp "press Enter..." _
+  exit 0
+fi
+
+path=$(printf '%s' "$rec" | awk -F'\t' '{print $3}')
+file="${path%%:*}"
+line=""
+case "$path" in
+  *:*) line="${path##*:}" ;;
+esac
+
+if [ ! -r "$file" ]; then
+  echo "(cannot read: $file)"
+  read -rp "press Enter..." _
+  exit 0
+fi
+
+# Prefer batcat/bat (syntax highlight) — uses less internally for mouse selection
+if command -v batcat >/dev/null 2>&1; then
+  BAT=batcat
+elif command -v bat >/dev/null 2>&1; then
+  BAT=bat
+else
+  BAT=""
+fi
+
+if [ -n "$BAT" ]; then
+  if [ -n "$line" ]; then
+    "$BAT" --paging=always --style=numbers,changes --highlight-line="$line" "$file"
+  else
+    "$BAT" --paging=always --style=numbers,changes "$file"
+  fi
+else
+  if [ -n "$line" ]; then
+    less -R "+${line}" "$file"
+  else
+    less -R "$file"
+  fi
+fi

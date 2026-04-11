@@ -1,0 +1,54 @@
+# toolshed configuration
+# Copy to ~/.config/toolshed/config and edit
+# This file is sourced by bash — use shell variable syntax
+
+# ── Directories to scan for scripts ──
+# Space-separated list of directories to scan (maxdepth 1)
+# Default: "/usr/local/bin $HOME/bin $HOME/.local/bin $HOME/scripts"
+#TOOLSHED_SCAN_DIRS="/usr/local/bin $HOME/bin $HOME/.local/bin $HOME/scripts"
+
+# ── Semantic search (optional) ──
+# Cohere API key for embedding-based natural language search (--ask)
+# Get a free key at: https://dashboard.cohere.com/api-keys
+# Free tier: 1000 API calls/month — more than enough for personal use
+# Set here OR export COHERE_API_KEY in your shell environment
+#COHERE_API_KEY=""
+
+# Python interpreter with cohere + numpy installed
+# If empty, uses system python3 (must have cohere + numpy)
+# Example: "/path/to/venv/bin/python3"
+#TOOLSHED_EMBED_PYTHON=""
+
+# ── Claude Code integration (optional, disabled by default) ──
+# Path to Claude Code session directory for MCP tool discovery
+# Example: "$HOME/.claude/projects/-home-username"
+#TOOLSHED_CLAUDE_SESSIONS=""
+
+# Path to Claude Code slash commands directory
+# Example: "$HOME/.claude/commands"
+#TOOLSHED_CLAUDE_COMMANDS=""
+
+# ── Exclusions ──
+# Additional third-party binary names to exclude (pipe-separated regex)
+# These are appended to the built-in exclusion list
+# Example: "^(terraform|kubectl|helm)$"
+#TOOLSHED_EXTRA_EXCLUDE=""
+
+# ── Custom categories ──
+# Path to a file containing a bash function named category_override()
+# It receives a command name as $1 and should echo a category name.
+# Return empty string to fall back to the built-in categorizer.
+# Example file content:
+#   category_override() {
+#     case "$1" in
+#       deploy-*) echo "deploy" ;;
+#       k8s-*)    echo "kubernetes" ;;
+#       *)        echo "" ;;  # fallback to defaults
+#     esac
+#   }
+#TOOLSHED_CATEGORIES_FILE=""
+
+# ── History scanning (for toolshed-discover) ──
+# Additional history files to scan (space-separated)
+# ~/.bash_history is always scanned
+#TOOLSHED_EXTRA_HISTORY=""

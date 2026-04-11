@@ -1,0 +1,252 @@
+#!/bin/bash
+# toolshed — interactive fuzzy picker for your personal command catalog
+# Browse, search, and launch your scripts, functions, aliases, and MCP tools
+#
+# Reads ~/.local/share/toolshed/index.tsv (built by toolshed-index)
+# Uses fzf + bat/batcat for preview; falls back to select menu if fzf missing
+#
+# Part of the toolshed catalog toolkit
+# https://github.com/YOUR_USERNAME/toolshed
+
+set -u
+
+TOOLSHED_DIR="${TOOLSHED_DIR:-${HOME}/.local/share/toolshed}"
+TOOLSHED_CONFIG="${TOOLSHED_CONFIG:-${HOME}/.config/toolshed/config}"
+INDEX="$TOOLSHED_DIR/index.tsv"
+CMDLIST="$TOOLSHED_DIR/CMDLIST.md"
+
+# Load user config if present
+# shellcheck disable=SC1090
+[ -f "$TOOLSHED_CONFIG" ] && source "$TOOLSHED_CONFIG"
+
+# --------- pick syntax-highlight tool ---------
+if command -v batcat >/dev/null 2>&1; then
+  BAT=batcat
+elif command -v bat >/dev/null 2>&1; then
+  BAT=bat
+else
+  BAT=""
+fi
+
+usage() {
+  cat <<'EOF'
+toolshed — fuzzy picker for your personal command catalog
+
+Usage:
+  toolshed                    interactive fuzzy picker (fzf)
+  toolshed <query>            non-interactive filter, auto-pick if unique
+  toolshed --ask "<text>"     natural-language semantic search (Cohere embed)
+  toolshed --list             plain table of everything
+  toolshed --list <category>  filter by category
+  toolshed --cats             list all categories with counts
+  toolshed --md               open CMDLIST.md in $PAGER
+  toolshed --refresh          regenerate the catalog (runs toolshed-index)
+  toolshed --help             this help
+
+Inside the picker:
+  Enter       pick highlighted row (script → run/edit prompt)
+  F3          open file in a full-screen pager (mouse-selectable, q to return)
+  Ctrl-E      open the highlighted file in $EDITOR (jumps to line for fn/alias)
+  Ctrl-Y      yank full source to clipboard
+  Ctrl-O      yank just the path to clipboard
+  Esc         cancel
+
+Catalog location: ~/.local/share/toolshed/
+Configuration:    ~/.config/toolshed/config
+EOF
+  exit 0
+}
+
+ensure_index() {
+  if [ ! -f "$INDEX" ]; then
+    echo "catalog not found at $INDEX" >&2
+    echo "run: toolshed-index" >&2
+    exit 1
+  fi
+}
+
+# --------- resolve python for embeddings ---------
+get_embed_python() {
+  if [ -n "${TOOLSHED_EMBED_PYTHON:-}" ] && [ -x "$TOOLSHED_EMBED_PYTHON" ]; then
+    echo "$TOOLSHED_EMBED_PYTHON"
+  else
+    echo "python3"
+  fi
+}
+
+# --------- subcommands ---------
+case "${1:-}" in
+  -h|--help) usage ;;
+  --refresh) exec toolshed-index ;;
+  --md)
+    ensure_index
+    exec ${PAGER:-less} "$CMDLIST"
+    ;;
+  --cats)
+    ensure_index
+    awk -F'\t' 'NR>1 {c[$4]++} END {for (k in c) printf "%-14s %d\n", k, c[k]}' "$INDEX" | sort -k2 -rn
+    exit 0
+    ;;
+  --list)
+    ensure_index
+    cat_filter="${2:-}"
+    awk -F'\t' -v cf="$cat_filter" 'NR>1 && (cf=="" || $4==cf) {
+      printf "%-9s %-32s %-12s %s\n", $1, $2, $4, substr($5, 1, 70)
+    }' "$INDEX" | sort
+    exit 0
+    ;;
+  --ask)
+    ensure_index
+    query="${2:-}"
+    if [ -z "$query" ]; then
+      echo "usage: toolshed --ask \"<natural language query>\" [topk]" >&2
+      exit 1
+    fi
+    topk="${3:-20}"
+    emb_file="$TOOLSHED_DIR/embeddings.npz"
+    if [ ! -f "$emb_file" ]; then
+      echo "embedding cache not found at $emb_file" >&2
+      echo "run: toolshed-index  (requires COHERE_API_KEY)" >&2
+      echo "" >&2
+      echo "Semantic search is optional. See: toolshed --help" >&2
+      exit 1
+    fi
+    EMBED_PY=$(get_embed_python)
+    if ! "$EMBED_PY" -c "import cohere, numpy" 2>/dev/null; then
+      echo "missing Python dependencies: cohere, numpy" >&2
+      echo "install: pip install cohere numpy" >&2
+      exit 1
+    fi
+    if [ -z "${COHERE_API_KEY:-}" ]; then
+      echo "COHERE_API_KEY not set" >&2
+      echo "get a free key at: https://dashboard.cohere.com/api-keys" >&2
+      exit 1
+    fi
+    export TOOLSHED_ASK_Q="$query"
+    export TOOLSHED_ASK_K="$topk"
+    export TOOLSHED_ASK_EMB="$emb_file"
+    export TOOLSHED_ASK_INDEX="$INDEX"
+    "$EMBED_PY" - << 'PYEOF'
+import os, sys
+import numpy as np
+import cohere
+
+q    = os.environ['TOOLSHED_ASK_Q']
+k    = int(os.environ['TOOLSHED_ASK_K'])
+emb  = os.environ['TOOLSHED_ASK_EMB']
+idxf = os.environ['TOOLSHED_ASK_INDEX']
+
+data = np.load(emb, allow_pickle=True)
+V, keys = data['vectors'], data['keys']
+
+co = cohere.ClientV2(api_key=os.environ['COHERE_API_KEY'])
+r = co.embed(
+    texts=[q],
+    model='embed-multilingual-v3.0',
+    input_type='search_query',
+    embedding_types=['float'],
+)
+qv = np.array(r.embeddings.float_[0], dtype=np.float32)
+n = np.linalg.norm(qv)
+if n > 0:
+    qv = qv / n
+
+sims = V @ qv
+top = np.argsort(-sims)[:k]
+
+# load TSV for display
+rows = {}
+with open(idxf) as f:
+    next(f)
+    for line in f:
+        p = line.rstrip('\n').split('\t')
+        if len(p) >= 5:
+            rows[f"{p[0]}:{p[1]}"] = p
+
+print(f"\033[1mtoolshed --ask\033[0m \033[2m\"{q}\"\033[0m")
+print(f"\033[2m{'─' * 60}\033[0m")
+for rank, i in enumerate(top, 1):
+    key = keys[i]
+    row = rows.get(str(key))
+    if not row:
+        continue
+    score = float(sims[i])
+    name, type_, path, cat, desc = row[1], row[0], row[2], row[3], row[4]
+    print(f"\033[1;36m{rank}.\033[0m \033[1m{name}\033[0m  \033[2m[{type_}/{cat}]\033[0m  \033[33m{score:.3f}\033[0m")
+    print(f"   \033[2m{path}\033[0m")
+    if desc and desc != '—':
+        print(f"   {desc}")
+    print()
+PYEOF
+    exit $?
+    ;;
+esac
+
+ensure_index
+
+query="${1:-}"
+
+# --------- fzf fallback to select menu ---------
+if ! command -v fzf >/dev/null 2>&1; then
+  echo "fzf not installed — using numbered menu (install: sudo apt install fzf)"
+  mapfile -t items < <(awk -F'\t' 'NR>1 {printf "[%s] %s (%s) — %s\n", $1, $2, $4, substr($5,1,60)}' "$INDEX")
+  PS3="pick a tool> "
+  select choice in "${items[@]}"; do
+    [ -n "$choice" ] && break
+  done
+  name=$(echo "$choice" | sed -E 's/^\[[^]]+\] ([^ ]+).*/\1/')
+  type=$(echo "$choice" | sed -E 's/^\[([^]]+)\].*/\1/')
+  path=$(awk -F'\t' -v n="$name" -v t="$type" '$1==t && $2==n {print $3; exit}' "$INDEX")
+  echo "$type:$name → $path"
+  exit 0
+fi
+
+# --------- fzf picker (preferred path) ---------
+selection=$(awk -F'\t' 'NR>1 {printf "%-11s %-32s %-12s %s\n", "["$1"]", $2, $4, substr($5,1,80)}' "$INDEX" | \
+  fzf --prompt="tool> " \
+      --query="$query" \
+      --select-1 \
+      --header="[type]      name                             category     description" \
+      --header-first \
+      --reverse \
+      --ansi \
+      --no-mouse \
+      --preview='toolshed-preview {}' \
+      --preview-window='right,60%,border-left,wrap' \
+      --bind='ctrl-e:execute(toolshed-edit {})' \
+      --bind='ctrl-y:execute-silent(toolshed-yank {})' \
+      --bind='f3:execute(toolshed-view {})' \
+      --bind='ctrl-o:execute-silent(awk -F"\t" -v n="$(echo {} | awk "{print \$2}")" -v t="$(echo {} | awk "{print \$1}" | tr -d "[]")" "\$1==t && \$2==n {print \$3; exit}" '"$INDEX"' | tr -d "\n" | ${TOOLSHED_CLIP_CMD:-xclip -selection clipboard})')
+
+[ -z "$selection" ] && exit 0
+
+# parse picked row
+sel_type=$(echo "$selection" | awk '{print $1}' | tr -d '[]')
+sel_name=$(echo "$selection" | awk '{print $2}')
+sel_rec=$(awk -F'\t' -v t="$sel_type" -v n="$sel_name" '$1==t && $2==n {print; exit}' "$INDEX")
+sel_path=$(echo "$sel_rec" | awk -F'\t' '{print $3}')
+sel_expansion=$(echo "$sel_rec" | awk -F'\t' '{print $5}')
+
+case "$sel_type" in
+  script)
+    echo "=> $sel_name"
+    echo "   $sel_path"
+    if [ -t 0 ] && [ -t 1 ]; then
+      read -rp "run / edit / quit? [r/e/Q] " ans
+      case "${ans,,}" in
+        r) exec "$sel_path" ;;
+        e) exec "${EDITOR:-nano}" "$sel_path" ;;
+        *) exit 0 ;;
+      esac
+    fi
+    ;;
+  function)
+    echo "=> function $sel_name (defined at $sel_path)"
+    echo "   already loaded via bashrc — just type '$sel_name' in any bash shell"
+    ;;
+  alias)
+    echo "=> alias $sel_name (defined at $sel_path)"
+    echo "   expands to: $sel_expansion"
+    echo "   already loaded — just type '$sel_name' in any bash shell"
+    ;;
+esac

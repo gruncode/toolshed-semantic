@@ -1,0 +1,31 @@
+#!/bin/bash
+# Opens the selected toolshed catalog entry in $EDITOR, jumping to the correct line
+# Called by toolshed via Ctrl-E binding
+# Part of the toolshed catalog toolkit
+
+set -u
+
+TOOLSHED_DIR="${TOOLSHED_DIR:-${HOME}/.local/share/toolshed}"
+INDEX="$TOOLSHED_DIR/index.tsv"
+row="${1:-}"
+[ -z "$row" ] && exit 0
+
+type=$(printf '%s' "$row" | awk '{print $1}' | tr -d '[]')
+name=$(printf '%s' "$row" | awk '{print $2}')
+rec=$(awk -F'\t' -v t="$type" -v n="$name" '$1==t && $2==n {print; exit}' "$INDEX")
+[ -z "$rec" ] && exit 0
+path=$(printf '%s' "$rec" | awk -F'\t' '{print $3}')
+
+# for functions/aliases, path is "file:line" — split
+file="${path%%:*}"
+line=""
+case "$path" in
+  *:*) line="${path##*:}" ;;
+esac
+
+ED="${EDITOR:-nano}"
+if [ -n "$line" ]; then
+  exec "$ED" "+${line}" "$file"
+else
+  exec "$ED" "$file"
+fi

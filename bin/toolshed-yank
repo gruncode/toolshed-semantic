@@ -1,0 +1,88 @@
+#!/bin/bash
+# Copies the selected tool's full source or definition to clipboard
+# Called from toolshed via Ctrl-Y binding
+# Supports X11 (xclip), Wayland (wl-copy), macOS (pbcopy), and tmux
+# Part of the toolshed catalog toolkit
+
+set -u
+
+TOOLSHED_DIR="${TOOLSHED_DIR:-${HOME}/.local/share/toolshed}"
+INDEX="$TOOLSHED_DIR/index.tsv"
+row="${1:-}"
+[ -z "$row" ] && exit 0
+
+# Detect clipboard tool
+clip_copy() {
+  if command -v xclip >/dev/null 2>&1; then
+    xclip -selection clipboard < "$1" 2>/dev/null
+    xclip -selection primary   < "$1" 2>/dev/null
+  elif command -v wl-copy >/dev/null 2>&1; then
+    wl-copy < "$1" 2>/dev/null
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$1" 2>/dev/null
+  elif [ -n "${TMUX:-}" ]; then
+    tmux load-buffer "$1" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -t 2000 "toolshed-yank" "$1" 2>/dev/null
+  fi
+}
+
+type=$(printf '%s' "$row" | awk '{print $1}' | tr -d '[]')
+name=$(printf '%s' "$row" | awk '{print $2}')
+rec=$(awk -F'\t' -v t="$type" -v n="$name" '$1==t && $2==n {print; exit}' "$INDEX")
+if [ -z "$rec" ]; then
+  notify "no record for $type/$name"
+  exit 1
+fi
+
+path=$(printf '%s' "$rec" | awk -F'\t' '{print $3}')
+file="${path%%:*}"
+line=""
+case "$path" in
+  *:*) line="${path##*:}" ;;
+esac
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+case "$type" in
+  script)
+    if [ -r "$file" ]; then
+      cat "$file" > "$tmp"
+    else
+      echo "(unreadable: $file)" > "$tmp"
+    fi
+    ;;
+  function)
+    if [ -r "$file" ] && [ -n "$line" ]; then
+      awk -v start="$line" '
+        NR==start { inside=1 }
+        inside    { print }
+        inside && NR>start && /^[[:space:]]*\}[[:space:]]*$/ { exit }
+      ' "$file" > "$tmp"
+    fi
+    ;;
+  alias)
+    if [ -r "$file" ] && [ -n "$line" ]; then
+      sed -n "${line}p" "$file" > "$tmp"
+    fi
+    ;;
+  *)
+    echo "(unknown type: $type)" > "$tmp"
+    ;;
+esac
+
+if clip_copy "$tmp"; then
+  bytes=$(wc -c < "$tmp")
+  lines=$(wc -l < "$tmp")
+  notify "copied $type $name ($lines lines, $bytes bytes)"
+else
+  notify "no clipboard tool found (install xclip, wl-copy, or pbcopy)"
+  exit 1
+fi

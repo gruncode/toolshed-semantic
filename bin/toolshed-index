@@ -1,0 +1,640 @@
+#!/bin/bash
+# toolshed-index — scan your system and build the tool catalog
+# Scans bin dirs, bashrc, MCP servers, and optionally Claude Code sessions
+# Writes index.tsv, CMDLIST.md, and optionally Cohere embeddings
+#
+# Usage: toolshed-index [--no-embed]
+#
+# Part of the toolshed catalog toolkit
+# https://github.com/YOUR_USERNAME/toolshed
+
+set -u
+
+TOOLSHED_DIR="${TOOLSHED_DIR:-${HOME}/.local/share/toolshed}"
+TOOLSHED_CONFIG="${TOOLSHED_CONFIG:-${HOME}/.config/toolshed/config}"
+INDEX="$TOOLSHED_DIR/index.tsv"
+CMDLIST="$TOOLSHED_DIR/CMDLIST.md"
+CHANGELOG="$TOOLSHED_DIR/CHANGELOG.md"
+
+# Load user config
+# shellcheck disable=SC1090
+[ -f "$TOOLSHED_CONFIG" ] && source "$TOOLSHED_CONFIG"
+
+# Defaults (overridable via config)
+BASHRC_USER="${HOME}/.bashrc"
+BASHRC_SYS="/etc/bash.bashrc"
+NO_EMBED=0
+
+# Parse flags
+for arg in "$@"; do
+  case "$arg" in
+    --no-embed) NO_EMBED=1 ;;
+    -h|--help)
+      echo "Usage: toolshed-index [--no-embed]"
+      echo "  --no-embed   skip Cohere embedding generation"
+      exit 0
+      ;;
+  esac
+done
+
+# Build scan dirs from config or defaults
+IFS=' ' read -ra SCAN_DIRS <<< "${TOOLSHED_SCAN_DIRS:-/usr/local/bin ${HOME}/bin ${HOME}/.local/bin ${HOME}/scripts}"
+
+# Claude Code integration (optional)
+CLAUDE_CMDS_DIR="${TOOLSHED_CLAUDE_COMMANDS:-}"
+CLAUDE_SESSIONS_DIR="${TOOLSHED_CLAUDE_SESSIONS:-}"
+
+# Third-party binaries to exclude (not user-written)
+BUILTIN_EXCLUDE='^(aws|aws_completer|copilot|duckdb|geckodriver|ollama|trash-restore|uv|uvx|gcloud|claude)$'
+if [ -n "${TOOLSHED_EXTRA_EXCLUDE:-}" ]; then
+  THIRD_PARTY_RE="${BUILTIN_EXCLUDE}|${TOOLSHED_EXTRA_EXCLUDE}"
+else
+  THIRD_PARTY_RE="$BUILTIN_EXCLUDE"
+fi
+
+# Backup-suffix pattern (case-insensitive)
+BAK_RE='\.(bak|backup|tmp|orig|current-)|\.pre-|-bak-|-backup-|_before_|\.[0-9]{6,}_|\.[0-9]{8}-'
+
+mkdir -p "$TOOLSHED_DIR"
+
+# --------- helper: infer category from command name ---------
+# Generic defaults — override via TOOLSHED_CATEGORIES_FILE
+category_for() {
+  # Try user override first
+  if [ -n "${TOOLSHED_CATEGORIES_FILE:-}" ] && [ -f "$TOOLSHED_CATEGORIES_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$TOOLSHED_CATEGORIES_FILE"
+    if type category_override &>/dev/null; then
+      local result
+      result=$(category_override "$1")
+      if [ -n "$result" ]; then
+        echo "$result"
+        return
+      fi
+    fi
+  fi
+  # Built-in generic categories
+  case "$1" in
+    *search*|*find*|*grep*|*locate*) echo search ;;
+    backup-*|*-backup|*-bak) echo backup ;;
+    docker-*|container-*) echo docker ;;
+    git-*) echo git ;;
+    ssh-*|vpn-*|tunnel-*) echo network ;;
+    chrome-*|firefox-*|browser-*) echo browser ;;
+    clip-*|clipboard-*|copy-*) echo clipboard ;;
+    vnc-*|vbox-*|vm-*|virtualbox-*) echo virt ;;
+    deploy-*|ci-*|cd-*) echo deploy ;;
+    test-*|check-*|lint-*) echo testing ;;
+    monitor-*|watch-*|alert-*) echo monitoring ;;
+    log-*|*-log|*-logs) echo logs ;;
+    speak*|tts-*|voice-*) echo tts ;;
+    toolshed|toolshed-*) echo catalog ;;
+    *) echo misc ;;
+  esac
+}
+
+# --------- helper: extract 1-line description from script header ---------
+extract_desc() {
+  local f="$1"
+  local desc
+  desc=$(head -20 "$f" 2>/dev/null | awk '
+    NR==1 && /^#!/ { next }
+    /^[[:space:]]*#[[:space:]]*=+/ { next }
+    /^[[:space:]]*#[[:space:]]*-+/ { next }
+    /^[[:space:]]*#[[:space:]]*[Kk]eywords?:/ { next }
+    /^[[:space:]]*#/ {
+      sub(/^[[:space:]]*#[[:space:]]*/, "")
+      if (length($0) > 0) { print; exit }
+    }
+    !/^[[:space:]]*#/ && NR>1 { exit }
+  ')
+  if [ -n "$desc" ]; then
+    printf '%s' "$desc"
+    return
+  fi
+  # Fallback: Python triple-quote docstring
+  head -20 "$f" 2>/dev/null | awk '
+    /^"""/ || /^'\'''\'''\''/ { in_doc=1; sub(/^"""|^'\'''\'''\''/, ""); if (length($0)>0 && $0 !~ /^=+$/ && $0 !~ /^-+$/) {print; exit}; next }
+    in_doc && /^=+$/ { next }
+    in_doc && /^-+$/ { next }
+    in_doc && /^[[:space:]]*$/ { next }
+    in_doc && (/^"""/||/^'\'''\'''\''/) { exit }
+    in_doc { sub(/^[[:space:]]*/, ""); if (length($0)>0) {print; exit} }
+  '
+}
+
+# --------- helper: extract Keywords: line from script header ---------
+extract_keywords() {
+  local f="$1"
+  head -20 "$f" 2>/dev/null | sed -n 's/^[[:space:]]*#[[:space:]]*[Kk]eywords\?:[[:space:]]*//p' | head -1
+}
+
+# --------- helper: extract @mcp.tool functions from a Python file via AST ---------
+extract_mcp_tools() {
+  local pyfile="$1" server_id="$2"
+  python3 -c "
+import ast, sys
+try:
+    with open('$pyfile') as f:
+        tree = ast.parse(f.read())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        is_tool = any(
+            (isinstance(d, ast.Attribute) and getattr(d, 'attr', '') == 'tool')
+            or (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and getattr(d.func, 'attr', '') == 'tool')
+            for d in node.decorator_list
+        )
+        if not is_tool:
+            continue
+        doc = ast.get_docstring(node) or ''
+        first_line = doc.split(chr(10))[0].strip() if doc else ''
+        if not first_line:
+            first_line = '—'
+        first_line = first_line.replace(chr(9), ' ')[:200]
+        print(f'$server_id/{node.name}\t{first_line}')
+except Exception as e:
+    print(f'# parse error: {e}', file=sys.stderr)
+" 2>/dev/null
+}
+
+# --------- scan scripts ---------
+TMP_TSV=$(mktemp)
+trap "rm -f '$TMP_TSV'" EXIT
+
+printf 'type\tname\tpath\tcategory\tdescription\tmtime\tkeywords\n' > "$TMP_TSV"
+
+count_scripts=0
+declare -A seen_inode   # dedupe symlinks pointing to same file
+
+for d in "${SCAN_DIRS[@]}"; do
+  [ -d "$d" ] || continue
+  while IFS= read -r -d '' f; do
+    base=$(basename "$f")
+
+    # skip backup files
+    echo "$base" | grep -qiE "$BAK_RE" && continue
+
+    # skip third-party
+    echo "$base" | grep -qE "$THIRD_PARTY_RE" && continue
+
+    # skip dpkg-owned (Debian/Ubuntu) or rpm-owned (RHEL/Fedora)
+    rp=$(readlink -f "$f" 2>/dev/null || echo "$f")
+    if command -v dpkg >/dev/null 2>&1; then
+      dpkg -S "$rp" >/dev/null 2>&1 && continue
+      dpkg -S "$f" >/dev/null 2>&1 && continue
+    elif command -v rpm >/dev/null 2>&1; then
+      rpm -qf "$rp" >/dev/null 2>&1 && continue
+    fi
+
+    # skip broken symlinks
+    if [ ! -e "$rp" ]; then
+      continue
+    fi
+
+    # dedupe by resolved inode (handles symlinks)
+    inode=$(stat -c '%i:%d' "$rp" 2>/dev/null)
+    if [ -n "$inode" ]; then
+      if [ -n "${seen_inode[$inode]:-}" ]; then
+        continue
+      fi
+      seen_inode["$inode"]=1
+    fi
+
+    desc=$(extract_desc "$f")
+    [ -z "$desc" ] && desc="—"
+    desc=$(printf '%s' "$desc" | tr '\t\n' '  ' | cut -c1-200)
+
+    kw=$(extract_keywords "$f")
+    kw=$(printf '%s' "$kw" | tr '\t\n' '  ' | cut -c1-300)
+
+    mtime=$(stat -c '%y' "$f" 2>/dev/null | cut -d' ' -f1)
+    cat=$(category_for "$base")
+
+    printf 'script\t%s\t%s\t%s\t%s\t%s\t%s\n' "$base" "$f" "$cat" "$desc" "$mtime" "$kw" >> "$TMP_TSV"
+    count_scripts=$((count_scripts + 1))
+  done < <(find "$d" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
+done
+
+# --------- parse shell functions from bashrc ---------
+for bashrc_file in "$BASHRC_SYS" "$BASHRC_USER"; do
+  [ -r "$bashrc_file" ] || continue
+  while IFS=: read -r line_no func_name; do
+    [ -z "$func_name" ] && continue
+    desc=$(sed -n "$((line_no + 1)),$((line_no + 5))p" "$bashrc_file" 2>/dev/null | grep -E '^[[:space:]]*#' | head -1 | sed 's/^[[:space:]]*#[[:space:]]*//')
+    [ -z "$desc" ] && desc=$(sed -n "$((line_no - 3)),$((line_no - 1))p" "$bashrc_file" 2>/dev/null | grep -E '^[[:space:]]*#' | tail -1 | sed 's/^[[:space:]]*#[[:space:]]*//')
+    [ -z "$desc" ] && desc="(function in $bashrc_file)"
+    desc=$(printf '%s' "$desc" | tr '\t\n' '  ' | cut -c1-200)
+    cat=$(category_for "$func_name")
+    printf 'function\t%s\t%s:%s\t%s\t%s\t—\t\n' "$func_name" "$bashrc_file" "$line_no" "$cat" "$desc" >> "$TMP_TSV"
+  done < <(awk '/^[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*\(\)/ {name=$1; sub(/\(\).*/,"",name); print NR ":" name}' "$bashrc_file")
+done
+count_funcs=$(awk -F'\t' '$1=="function"' "$TMP_TSV" | wc -l)
+
+# --------- parse aliases from bashrc files ---------
+for f in "$BASHRC_USER" "$BASHRC_SYS"; do
+  [ -r "$f" ] || continue
+  grep -nE '^[[:space:]]*alias[[:space:]]+[A-Za-z_@][A-Za-z0-9_@-]*=' "$f" 2>/dev/null | \
+  while IFS=: read -r line_no rest; do
+    name=$(printf '%s' "$rest" | sed -E 's/^[[:space:]]*alias[[:space:]]+([A-Za-z_@][A-Za-z0-9_@-]*)=.*/\1/')
+    expansion=$(printf '%s' "$rest" | sed -E "s/^[[:space:]]*alias[[:space:]]+[A-Za-z_@][A-Za-z0-9_@-]*=//; s/^['\"]//; s/['\"][[:space:]]*#?.*$//; s/^'//; s/'$//")
+    expansion=$(printf '%s' "$expansion" | tr '\t\n' '  ' | cut -c1-200)
+    cat=$(category_for "$name")
+    printf 'alias\t%s\t%s:%s\t%s\t%s\t—\t\n' "$name" "$f" "$line_no" "$cat" "$expansion" >> "$TMP_TSV"
+  done
+done
+count_aliases=$(awk -F'\t' '$1=="alias"' "$TMP_TSV" | wc -l)
+
+# --------- scan Claude Code slash commands (optional) ---------
+count_skills=0
+if [ -n "$CLAUDE_CMDS_DIR" ] && [ -d "$CLAUDE_CMDS_DIR" ]; then
+  for f in "$CLAUDE_CMDS_DIR"/*.md; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f" .md)
+    desc=$(grep -v '^$' "$f" | grep -v '^#' | head -1 | cut -c1-200)
+    [ -z "$desc" ] && desc="Claude Code slash command"
+    desc=$(printf '%s' "$desc" | tr '\t\n' '  ')
+    mtime=$(stat -c '%y' "$f" 2>/dev/null | cut -d' ' -f1)
+    printf 'skill\t/%s\t%s\tclaude\t%s\t%s\t\n' "$base" "$f" "$desc" "$mtime" >> "$TMP_TSV"
+    count_skills=$((count_skills + 1))
+  done
+fi
+
+# --------- scan MCP servers ---------
+count_mcp=0
+MCP_ROOT="${HOME}/.local/share/mcp"
+declare -A seen_mcp_dir
+
+MCP_DIRS=()
+
+# Source 1: standard MCP_ROOT subdirs
+if [ -d "$MCP_ROOT" ]; then
+  while IFS= read -r d; do
+    MCP_DIRS+=("$d")
+  done < <(find "$MCP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+fi
+
+# Source 2: extract server dirs from mcp config files
+for mcpjson in "${HOME}/.mcp.json" "${HOME}/.claude/mcp.json"; do
+  [ -f "$mcpjson" ] || continue
+  while IFS= read -r extra_dir; do
+    [ -z "$extra_dir" ] && continue
+    case "$extra_dir" in
+      "${MCP_ROOT}/"*) ;;
+      *) MCP_DIRS+=("$extra_dir") ;;
+    esac
+  done < <(python3 -c "
+import json, os, sys
+with open('$mcpjson') as f:
+    cfg = json.load(f)
+for name, srv in cfg.get('mcpServers', {}).items():
+    args = srv.get('args', [])
+    cmd = srv.get('command', '')
+    for a in args:
+        a = str(a)
+        if '/' in a and os.path.exists(a):
+            p = os.path.realpath(a)
+            d = os.path.dirname(p) if os.path.isfile(p) else p
+            print(d)
+            break
+    else:
+        if '/' in cmd and os.path.exists(cmd):
+            p = os.path.realpath(cmd)
+            d = os.path.dirname(p) if os.path.isfile(p) else p
+            print(d)
+" 2>/dev/null)
+done
+
+for server_dir in "${MCP_DIRS[@]}"; do
+  rsd=$(readlink -f "$server_dir" 2>/dev/null || echo "$server_dir")
+  [ -n "${seen_mcp_dir[$rsd]:-}" ] && continue
+  seen_mcp_dir["$rsd"]=1
+
+  pyproj="$server_dir/pyproject.toml"
+  readme="$server_dir/README.md"
+
+  proj_name=""
+  proj_desc=""
+  if [ -f "$pyproj" ]; then
+    proj_name=$(sed -n '/^\[project\]/,/^\[/{/^[[:space:]]*name[[:space:]]*=/s/^[^=]*=[[:space:]]*["'"'"']\?\([^"'"'"']*\).*/\1/p}' "$pyproj" | head -1)
+    proj_desc=$(sed -n '/^\[project\]/,/^\[/{/^[[:space:]]*description[[:space:]]*=/s/^[^=]*=[[:space:]]*["'"'"']\?\([^"'"'"']*\).*/\1/p}' "$pyproj" | head -1)
+  fi
+  [ -z "$proj_name" ] && proj_name=$(basename "$server_dir")
+  [ -z "$proj_desc" ] && [ -f "$readme" ] && proj_desc=$(grep -v '^[[:space:]]*$' "$readme" | grep -v '^#' | head -1)
+  [ -z "$proj_desc" ] && proj_desc="MCP server"
+  proj_desc=$(printf '%s' "$proj_desc" | tr '\t\n' '  ' | cut -c1-200)
+
+  server_id=$(printf '%s' "$proj_name" | tr '[:upper:] ' '[:lower:]-' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+|-+$//g')
+  mtime=$(stat -c '%y' "${pyproj:-$server_dir}" 2>/dev/null | cut -d' ' -f1)
+
+  printf 'mcp-server\t%s\t%s\tai-mcp\t%s\t%s\t\n' "$server_id" "$server_dir" "$proj_desc" "$mtime" >> "$TMP_TSV"
+
+  # Extract @mcp.tool functions from Python files
+  declare -A seen_pyfile
+  while IFS= read -r -d '' tools_py; do
+    rpf=$(readlink -f "$tools_py" 2>/dev/null || echo "$tools_py")
+    [ -n "${seen_pyfile[$rpf]:-}" ] && continue
+    seen_pyfile["$rpf"]=1
+    case "$rpf" in */site-packages/*) continue ;; esac
+
+    tmtime=$(stat -c '%y' "$tools_py" 2>/dev/null | cut -d' ' -f1)
+    extract_mcp_tools "$tools_py" "$server_id" | while IFS=$'\t' read -r tool_name tool_desc; do
+      printf 'mcp-tool\t%s\t%s\tai-mcp\t%s\t%s\t\n' "$tool_name" "$tools_py" "$tool_desc" "$tmtime" >> "$TMP_TSV"
+    done
+  done < <(
+    find "$server_dir/src" -maxdepth 3 -type f -name '*.py' -print0 2>/dev/null
+    find "$server_dir" -maxdepth 1 -type f -name '*.py' -print0 2>/dev/null
+    find "$server_dir/bin" -maxdepth 1 -type f -name '*.py' -print0 2>/dev/null
+  )
+  unset seen_pyfile
+
+  # Index standalone scripts co-located with MCP servers
+  declare -A mcp_tool_files
+  while IFS=$'\t' read -r _t _n tf _rest; do
+    [ "$_t" = "mcp-tool" ] && mcp_tool_files["$tf"]=1
+  done < "$TMP_TSV"
+
+  while IFS= read -r -d '' sf; do
+    base=$(basename "$sf")
+    echo "$base" | grep -qiE "$BAK_RE" && continue
+    case "$base" in *.py|*.sh) ;; *) continue ;; esac
+    [ -x "$sf" ] || continue
+    rsf=$(readlink -f "$sf" 2>/dev/null || echo "$sf")
+    [ -n "${mcp_tool_files[$rsf]:-}" ] && continue
+    [ -n "${mcp_tool_files[$sf]:-}" ] && continue
+    awk -F'\t' '$1=="script" && $2=="'"$base"'" {found=1; exit} END {exit !found}' "$TMP_TSV" 2>/dev/null && continue
+
+    desc=$(extract_desc "$sf")
+    [ -z "$desc" ] && desc="—"
+    desc=$(printf '%s' "$desc" | tr '\t\n' '  ' | cut -c1-200)
+    smtime=$(stat -c '%y' "$sf" 2>/dev/null | cut -d' ' -f1)
+    cat=$(category_for "$base")
+    kw=$(extract_keywords "$sf")
+    kw=$(printf '%s' "$kw" | tr '\t\n' '  ' | cut -c1-300)
+    printf 'script\t%s\t%s\t%s\t%s\t%s\t%s\n' "$base" "$sf" "$cat" "$desc" "$smtime" "$kw" >> "$TMP_TSV"
+    count_scripts=$((count_scripts + 1))
+  done < <(find "$server_dir" -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' \) -print0 2>/dev/null)
+done
+
+# --------- discover cloud/plugin MCP tools from Claude sessions (optional) ---------
+if [ -n "$CLAUDE_SESSIONS_DIR" ] && [ -d "$CLAUDE_SESSIONS_DIR" ]; then
+  declare -A known_mcp_tools
+  while IFS=$'\t' read -r _t _n _rest; do
+    [ "$_t" = "mcp-tool" ] && known_mcp_tools["$_n"]=1
+  done < "$TMP_TSV"
+
+  find "$CLAUDE_SESSIONS_DIR" -name '*.jsonl' -mtime -60 -print0 2>/dev/null | \
+    xargs -0 grep -oh '"name":"mcp__[^"]*"' 2>/dev/null | \
+    sed 's/"name":"//; s/"//' | sort | uniq -c | sort -rn | \
+  while read -r usage_count raw_name; do
+    [ -z "$raw_name" ] && continue
+    [ "$usage_count" -lt 2 ] && continue
+
+    short=""
+    kind=""
+    rest="${raw_name#mcp__}"
+    if [[ "$rest" =~ ^claude_ai_(.+)__(.+)$ ]]; then
+      srv="${BASH_REMATCH[1]}"
+      tool="${BASH_REMATCH[2]}"
+      short="$srv/$tool"
+      kind="cloud"
+    elif [[ "$rest" =~ ^plugin_[^_]+_([^_]+)__(.+)$ ]]; then
+      srv="${BASH_REMATCH[1]}"
+      tool="${BASH_REMATCH[2]}"
+      short="$srv/$tool"
+      kind="plugin"
+    elif [[ "$rest" =~ ^([^_]+)__(.+)$ ]]; then
+      srv="${BASH_REMATCH[1]}"
+      tool="${BASH_REMATCH[2]}"
+      short="$srv/$tool"
+      kind="local"
+    else
+      continue
+    fi
+
+    [ -n "${known_mcp_tools[$short]:-}" ] && continue
+
+    if [ "$kind" = "local" ]; then
+      awk -F'\t' -v s="$srv" '$1=="mcp-server" && $2==s {found=1; exit} END {exit !found}' "$TMP_TSV" 2>/dev/null || continue
+    fi
+
+    desc=$(echo "$tool" | tr '_' ' ')
+    [ "$kind" != "local" ] && desc="$desc ($kind)"
+
+    printf 'mcp-tool\t%s\t%s\tai-mcp\t%s\t—\t\n' "$short" "($kind)" "$desc" >> "$TMP_TSV"
+    known_mcp_tools["$short"]=1
+  done
+fi
+
+count_mcp=$(awk -F'\t' '$1=="mcp-tool" || $1=="mcp-server"' "$TMP_TSV" | wc -l)
+
+# --------- write outputs ---------
+cp "$TMP_TSV" "$INDEX"
+chmod 644 "$INDEX"
+
+{
+  echo "# toolshed catalog"
+  echo
+  echo "_Generated $(date '+%Y-%m-%d %H:%M:%S') by \`toolshed-index\` on $(hostname)_"
+  echo
+  total=$((count_scripts + count_funcs + count_aliases + count_skills + count_mcp))
+  echo "**Totals:** $count_scripts scripts + $count_funcs functions + $count_aliases aliases + $count_skills skills + $count_mcp mcp = **${total}** commands"
+  echo
+  echo "- Regenerate: \`toolshed-index\`"
+  echo "- Search interactively: \`toolshed\`"
+  echo "- Filter by category: \`toolshed --list <category>\`"
+  echo
+
+  for type in script function alias skill mcp-server mcp-tool; do
+    type_label=$(echo "$type" | sed 's/.*/\u&s/')
+    echo "## $type_label"
+    echo
+    awk -F'\t' -v t="$type" '$1==t' "$INDEX" | sort -t$'\t' -k4,4 -k2,2 > /tmp/toolshed-md-tmp.$$
+    prev_cat=""
+    while IFS=$'\t' read -r T name path cat desc mtime kw; do
+      if [ "$cat" != "$prev_cat" ]; then
+        [ -n "$prev_cat" ] && echo
+        echo "### $cat"
+        echo
+        prev_cat="$cat"
+      fi
+      d=$(printf '%s' "$desc" | sed 's/|/\\|/g')
+      echo "- \`$name\` — $d"
+      echo "  \`$path\`"
+    done < /tmp/toolshed-md-tmp.$$
+    rm -f /tmp/toolshed-md-tmp.$$
+    echo
+  done
+} > "$CMDLIST"
+
+{
+  echo "$(date '+%Y-%m-%d %H:%M:%S')  scripts=$count_scripts  functions=$count_funcs  aliases=$count_aliases  skills=$count_skills  mcp=$count_mcp  total=$((count_scripts + count_funcs + count_aliases + count_skills + count_mcp))"
+} >> "$CHANGELOG"
+
+# --------- build Cohere embedding cache (optional) ---------
+emb_status="skipped"
+if [ "$NO_EMBED" -eq 1 ]; then
+  emb_status="skipped (--no-embed)"
+elif [ -z "${COHERE_API_KEY:-}" ]; then
+  emb_status="skipped (COHERE_API_KEY not set — semantic search disabled)"
+else
+  EMBED_PY="${TOOLSHED_EMBED_PYTHON:-python3}"
+  if ! "$EMBED_PY" -c "import cohere, numpy" 2>/dev/null; then
+    emb_status="skipped (python deps missing: pip install cohere numpy)"
+  elif (
+    export TOOLSHED_IDX="$INDEX"
+    export TOOLSHED_EMB_OUT="$TOOLSHED_DIR/embeddings.npz"
+    "$EMBED_PY" - << 'PYEOF' 2>&1
+import os, sys, re
+import numpy as np
+import cohere
+
+idx = os.environ['TOOLSHED_IDX']
+out = os.environ['TOOLSHED_EMB_OUT']
+
+rows = []
+with open(idx) as f:
+    header = f.readline()
+    for line in f:
+        parts = line.rstrip('\n').split('\t')
+        if len(parts) >= 5:
+            while len(parts) < 7:
+                parts.append('')
+            rows.append(parts)
+
+if not rows:
+    print("  embeddings: no rows to index", file=sys.stderr)
+    sys.exit(0)
+
+# ── Semantic enrichment ──
+# Translate raw alias expansions into natural-language sentences
+# so embedding vectors capture meaning, not shell syntax noise
+
+def _extract_ssh_host(expansion):
+    """Pull the hostname from an SSH-like alias expansion."""
+    m = re.search(r'@(\S+?)(?:\s|:|$)', expansion)
+    if m:
+        return m.group(1).rstrip(':')
+    parts = expansion.split()
+    for i, p in enumerate(parts):
+        if p == 'ssh' and i + 1 < len(parts) and not parts[i+1].startswith('-'):
+            return parts[i+1]
+    return ""
+
+def _extract_mount_target(expansion):
+    """Extract mount point from sshfs/mount expansions."""
+    m = re.search(r'\s(/\S+)\s*$', expansion)
+    return m.group(1) if m else ""
+
+def enrich(t, name, cat, desc, keywords=''):
+    """Build a semantically rich text for embedding each catalog entry."""
+    d = (desc or "").strip()
+    dl = d.lower()
+    kw_suffix = f" — keywords: {keywords}" if keywords and keywords.strip() else ""
+
+    if t == "alias":
+        # Detect common alias patterns and describe them in natural language
+        if dl.startswith("ssh ") and "sshfs" not in dl:
+            host = _extract_ssh_host(d) or name
+            return (f"alias {name} connect ssh remote login interactive shell session "
+                    f"to host {host} via ssh protocol terminal remote access")
+        if "autossh" in dl:
+            host = _extract_ssh_host(d) or name
+            return (f"alias {name} autossh persistent ssh tunnel auto-reconnect "
+                    f"to remote host {host} stable connection")
+        if "sshfs" in dl:
+            host = _extract_ssh_host(d) or name
+            target = _extract_mount_target(d)
+            return (f"alias {name} sshfs mount remote filesystem as network drive "
+                    f"from host {host} {target} network filesystem mount")
+        if dl.startswith("umount") or " umount" in dl:
+            return f"alias {name} unmount dismount filesystem network drive release"
+        if dl.startswith("mount ") and "cifs" in dl:
+            return f"alias {name} mount cifs samba windows network share filesystem"
+        if dl.startswith("mount "):
+            return f"alias {name} mount filesystem local bind directory"
+        if dl.startswith("locate"):
+            return f"alias {name} locate fast file search database by filename"
+        if "ps -eo" in dl or dl.startswith("ps "):
+            return f"alias {name} ps process list running processes by user cpu memory"
+        if dl.startswith("ls "):
+            return f"alias {name} ls directory listing files color human readable"
+        if dl.startswith("grep"):
+            return f"alias {name} grep text search pattern in files color highlight"
+        if "dmesg" in dl:
+            return f"alias {name} dmesg kernel log messages human readable timestamps"
+        if "vglrun" in dl:
+            return f"alias {name} virtualgl vglrun gpu graphics 3d accelerated opengl"
+        if "source" in dl and "venv" in dl:
+            return f"alias {name} python venv virtualenv activate environment"
+        return f"alias {name} ({cat}) {d}"
+
+    if t == "function":
+        return f"function {name} ({cat}) {d if d and d != '—' else name}"
+
+    if t == "skill":
+        return (f"skill slash command {name} Claude Code custom command "
+                f"({cat}) {d if d and d != '—' else name}")
+
+    if t == "mcp-server":
+        shown = d if d and d != "—" else name
+        return (f"MCP server {name} model context protocol service integration "
+                f"({cat}) {shown}")
+
+    if t == "mcp-tool":
+        parts = name.split("/", 1)
+        server = parts[0] if parts else "server"
+        tool = parts[1] if len(parts) > 1 else name
+        shown = d if d and d != "—" else tool
+        srv_desc = ""
+        for sr in rows:
+            if sr[0] == "mcp-server" and sr[1] == server:
+                srv_desc = sr[4] if sr[4] and sr[4] != "—" else ""
+                break
+        ctx = f" {srv_desc}" if srv_desc else ""
+        return (f"mcp tool {tool} from MCP server {server}{ctx} model context protocol "
+                f"API integration ({cat}) {shown}")
+
+    # scripts: header comment + keywords
+    shown = d if d and d != "—" else name
+    return f"script {name} ({cat}) {shown}{kw_suffix}"
+
+texts = [enrich(r[0], r[1], r[3], r[4], r[6] if len(r) > 6 else '') for r in rows]
+keys  = [f"{r[0]}:{r[1]}" for r in rows]
+
+co = cohere.ClientV2(api_key=os.environ['COHERE_API_KEY'])
+vecs = []
+# Cohere v3 max batch = 96
+for i in range(0, len(texts), 96):
+    r = co.embed(
+        texts=texts[i:i + 96],
+        model='embed-multilingual-v3.0',
+        input_type='search_document',
+        embedding_types=['float'],
+    )
+    vecs.extend(r.embeddings.float_)
+
+V = np.array(vecs, dtype=np.float32)
+norms = np.linalg.norm(V, axis=1, keepdims=True)
+V = V / np.where(norms > 0, norms, 1.0)
+np.savez_compressed(out, vectors=V, keys=np.array(keys))
+print(f"  embeddings: {V.shape[0]} rows x {V.shape[1]}-dim -> {out}")
+PYEOF
+  ); then
+    emb_status="ok"
+  else
+    emb_status="failed (API error — check COHERE_API_KEY)"
+  fi
+fi
+
+total=$((count_scripts + count_funcs + count_aliases + count_skills + count_mcp))
+echo "catalog written to $TOOLSHED_DIR"
+echo "  scripts   : $count_scripts"
+echo "  functions : $count_funcs"
+echo "  aliases   : $count_aliases"
+echo "  skills    : $count_skills"
+echo "  mcp       : $count_mcp"
+echo "  total     : $total"
+echo "  index     : $INDEX"
+echo "  markdown  : $CMDLIST"
+echo "  embeddings: $emb_status"
