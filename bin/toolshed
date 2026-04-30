@@ -1,23 +1,16 @@
 #!/bin/bash
-# toolshed — interactive fuzzy picker for your personal command catalog
-# Browse, search, and launch your scripts, functions, aliases, and MCP tools
-#
-# Reads ~/.local/share/toolshed/index.tsv (built by toolshed-index)
+# Interactive fuzzy picker for browsing, searching, and launching user-written scripts, functions, and aliases
+# Keywords: gt, tool catalog, fuzzy finder, fzf picker, command browser, script launcher, alias lookup, semantic search, Cohere embed, mytools
+# gt — fuzzy picker for george's tool catalog
+# Reads ~/.local/share/mytools/index.tsv (built by gt-index)
 # Uses fzf + bat/batcat for preview; falls back to select menu if fzf missing
-#
-# Part of the toolshed catalog toolkit
-# https://github.com/gruncode/toolshed-semantic
+# Part of the `gt` catalog toolkit (see also: `gt-index`)
 
 set -u
 
-TOOLSHED_DIR="${TOOLSHED_DIR:-${HOME}/.local/share/toolshed}"
-TOOLSHED_CONFIG="${TOOLSHED_CONFIG:-${HOME}/.config/toolshed/config}"
-INDEX="$TOOLSHED_DIR/index.tsv"
-CMDLIST="$TOOLSHED_DIR/CMDLIST.md"
-
-# Load user config if present
-# shellcheck disable=SC1090
-[ -f "$TOOLSHED_CONFIG" ] && source "$TOOLSHED_CONFIG"
+MYTOOLS_DIR="${HOME}/.local/share/mytools"
+INDEX="$MYTOOLS_DIR/index.tsv"
+CMDLIST="$MYTOOLS_DIR/CMDLIST.md"
 
 # --------- pick syntax-highlight tool ---------
 if command -v batcat >/dev/null 2>&1; then
@@ -30,29 +23,92 @@ fi
 
 usage() {
   cat <<'EOF'
-toolshed — fuzzy picker for your personal command catalog
+gt — fuzzy picker for your self-written commands (scripts + functions + aliases)
 
 Usage:
-  toolshed                    interactive fuzzy picker (fzf)
-  toolshed <query>            non-interactive filter, auto-pick if unique
-  toolshed --ask "<text>"     natural-language semantic search (Cohere embed)
-  toolshed --list             plain table of everything
-  toolshed --list <category>  filter by category
-  toolshed --cats             list all categories with counts
-  toolshed --md               open CMDLIST.md in $PAGER
-  toolshed --refresh          regenerate the catalog (runs toolshed-index)
-  toolshed --help             this help
+  gt                    interactive fuzzy picker (fzf) — browse everything
+  gt <query>            non-interactive filter, auto-pick if unique match
+  gt --ask "<NL text>"  natural-language semantic search (Cohere embed)
+  gt --list             plain table of ALL commands
+  gt --list <category>  filter by category
+  gt --cats             list all categories with counts
+  gt --md               open CMDLIST.md in $PAGER
+  gt --refresh          regenerate catalog + embeddings (run after adding scripts)
+  gt --help             this help
 
-Inside the picker:
-  Enter       pick highlighted row (script → run/edit prompt)
-  F3          open file in a full-screen pager (mouse-selectable, q to return)
-  Ctrl-E      open the highlighted file in $EDITOR (jumps to line for fn/alias)
-  Ctrl-Y      yank full source to clipboard
-  Ctrl-O      yank just the path to clipboard
+Categories: browser  web-auto  search  claude  ai-mcp  clipboard  audio
+            system   network   misc    media   backup  service
+
+── EXAMPLES ──────────────────────────────────────────────────────────────
+
+  # Find and launch Chrome with CDP debug port (web automation)
+  gt chrome-cdp
+  DISPLAY=:1 chrome-cdp &
+
+  # List all web automation scripts
+  gt --list web-auto
+
+  # Natural language: find a tool by describing what it does
+  gt --ask "scrape facebook events"
+  gt --ask "change prices on website"
+  gt --ask "download emails from outlook"
+  gt --ask "search my documents semantically"
+  gt --ask "read news aloud"
+
+  # Find anything browser-related
+  gt --list browser
+
+  # Quick keyword filter (non-interactive, prints if unique match)
+  gt fb-scrape
+  gt nbg
+  gt chrome-vnc
+
+  # Open script in editor directly
+  gt chrome-cdp   → then press Ctrl-E
+
+  # Copy path to clipboard
+  gt fb-scrape    → then press Ctrl-O
+
+  # View full script without running it
+  gt crawl        → then press F3
+
+── WEB AUTOMATION QUICK REFERENCE ───────────────────────────────────────
+
+  Step 1 — Start Chrome with CDP:
+    DISPLAY=:1 chrome-cdp &
+    # check it started: curl -s http://127.0.0.1:9222/json/version | head -2
+
+  Step 2 — Log into target site manually in the Chrome window
+
+  Step 3 — Connect from Python:
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp('http://127.0.0.1:9222')
+        page = browser.contexts[0].pages[0]
+        page.goto('https://example.com/dashboard')
+        # Read DOM:    page.query_selector('input[name="price"]').input_value()
+        # Fill hidden: page.evaluate("document.querySelector('input[name=price]').value='20'")
+        # Click:       page.query_selector('a.save').click()
+        # ArrowDown:   page.keyboard.press('ArrowDown')  # for Outlook-like lists
+
+  Scripts:
+    fb-scrape-events.py   — Facebook events (Selenium + cloned FF profile)
+    nbg-session.py        — NBG bank interactive session
+    crawl_redownloadGOOD.py — Outlook email bulk download (ArrowDown method)
+    chrome-cdp            — Launch Chrome with CDP port 9222 (permanent profile)
+
+── PICKER KEYS ───────────────────────────────────────────────────────────
+
+  Enter       pick (script → run/edit prompt)
+  F3          open in full-screen pager (q to return)
+  Ctrl-E      open in $EDITOR (jumps to line for fn/alias)
+  Ctrl-Y      yank full source to X11 clipboard
+  Ctrl-O      yank path to clipboard
   Esc         cancel
 
-Catalog location: ~/.local/share/toolshed/
-Configuration:    ~/.config/toolshed/config
+After selection: scripts prompt to run/edit; functions/aliases show their definition.
+
+Catalog location: ~/.local/share/mytools/
 EOF
   exit 0
 }
@@ -60,24 +116,15 @@ EOF
 ensure_index() {
   if [ ! -f "$INDEX" ]; then
     echo "catalog not found at $INDEX" >&2
-    echo "run: toolshed-index" >&2
+    echo "run: gt-index" >&2
     exit 1
-  fi
-}
-
-# --------- resolve python for embeddings ---------
-get_embed_python() {
-  if [ -n "${TOOLSHED_EMBED_PYTHON:-}" ] && [ -x "$TOOLSHED_EMBED_PYTHON" ]; then
-    echo "$TOOLSHED_EMBED_PYTHON"
-  else
-    echo "python3"
   fi
 }
 
 # --------- subcommands ---------
 case "${1:-}" in
   -h|--help) usage ;;
-  --refresh) exec toolshed-index ;;
+  --refresh) exec gt-index ;;
   --md)
     ensure_index
     exec ${PAGER:-less} "$CMDLIST"
@@ -99,42 +146,33 @@ case "${1:-}" in
     ensure_index
     query="${2:-}"
     if [ -z "$query" ]; then
-      echo "usage: toolshed --ask \"<natural language query>\" [topk]" >&2
+      echo "usage: gt --ask \"<natural language query>\" [topk]" >&2
       exit 1
     fi
     topk="${3:-20}"
-    emb_file="$TOOLSHED_DIR/embeddings.npz"
+    emb_file="$MYTOOLS_DIR/embeddings.npz"
     if [ ! -f "$emb_file" ]; then
       echo "embedding cache not found at $emb_file" >&2
-      echo "run: toolshed-index  (requires COHERE_API_KEY)" >&2
-      echo "" >&2
-      echo "Semantic search is optional. See: toolshed --help" >&2
+      echo "run: toolshed --refresh  (and make sure COHERE_API_KEY is set in your environment)" >&2
       exit 1
     fi
-    EMBED_PY=$(get_embed_python)
-    if ! "$EMBED_PY" -c "import cohere, numpy" 2>/dev/null; then
-      echo "missing Python dependencies: cohere, numpy" >&2
-      echo "install: pip install cohere numpy" >&2
-      exit 1
-    fi
-    if [ -z "${COHERE_API_KEY:-}" ]; then
-      echo "COHERE_API_KEY not set" >&2
-      echo "get a free key at: https://dashboard.cohere.com/api-keys" >&2
-      exit 1
-    fi
-    export TOOLSHED_ASK_Q="$query"
-    export TOOLSHED_ASK_K="$topk"
-    export TOOLSHED_ASK_EMB="$emb_file"
-    export TOOLSHED_ASK_INDEX="$INDEX"
-    "$EMBED_PY" - << 'PYEOF'
+    # NL search — subshell scope so secrets never escape
+    EMBED_PY="${TOOLSHED_EMBED_PYTHON:-python3}"
+    (
+      [ -n "${COHERE_API_KEY:-}" ] || { echo "COHERE_API_KEY unavailable" >&2; exit 1; }
+      export GT_ASK_Q="$query"
+      export GT_ASK_K="$topk"
+      export GT_ASK_EMB="$emb_file"
+      export GT_ASK_INDEX="$INDEX"
+      "$EMBED_PY" - << 'PYEOF'
 import os, sys
 import numpy as np
 import cohere
 
-q    = os.environ['TOOLSHED_ASK_Q']
-k    = int(os.environ['TOOLSHED_ASK_K'])
-emb  = os.environ['TOOLSHED_ASK_EMB']
-idxf = os.environ['TOOLSHED_ASK_INDEX']
+q    = os.environ['GT_ASK_Q']
+k    = int(os.environ['GT_ASK_K'])
+emb  = os.environ['GT_ASK_EMB']
+idxf = os.environ['GT_ASK_INDEX']
 
 data = np.load(emb, allow_pickle=True)
 V, keys = data['vectors'], data['keys']
@@ -163,7 +201,7 @@ with open(idxf) as f:
         if len(p) >= 5:
             rows[f"{p[0]}:{p[1]}"] = p
 
-print(f"\033[1mtoolshed --ask\033[0m \033[2m\"{q}\"\033[0m")
+print(f"\033[1mgt --ask\033[0m \033[2m\"{q}\"\033[0m")
 print(f"\033[2m{'─' * 60}\033[0m")
 for rank, i in enumerate(top, 1):
     key = keys[i]
@@ -178,6 +216,7 @@ for rank, i in enumerate(top, 1):
         print(f"   {desc}")
     print()
 PYEOF
+    )
     exit $?
     ;;
 esac
@@ -194,6 +233,7 @@ if ! command -v fzf >/dev/null 2>&1; then
   select choice in "${items[@]}"; do
     [ -n "$choice" ] && break
   done
+  # extract name, look up path
   name=$(echo "$choice" | sed -E 's/^\[[^]]+\] ([^ ]+).*/\1/')
   type=$(echo "$choice" | sed -E 's/^\[([^]]+)\].*/\1/')
   path=$(awk -F'\t' -v n="$name" -v t="$type" '$1==t && $2==n {print $3; exit}' "$INDEX")
@@ -202,21 +242,26 @@ if ! command -v fzf >/dev/null 2>&1; then
 fi
 
 # --------- fzf picker (preferred path) ---------
-selection=$(awk -F'\t' 'NR>1 {printf "%-11s %-32s %-12s %s\n", "["$1"]", $2, $4, substr($5,1,80)}' "$INDEX" | \
+# Build fzf input: aligned columns for human reading.
+# Preview and editor-bind logic live in separate helper scripts to avoid
+# shell-quoting hell with embedded heredocs.
+selection=$(gt-color-filter "$query" "$INDEX" | \
   fzf --prompt="tool> " \
       --query="$query" \
       --select-1 \
-      --header="[type]      name                             category     description" \
+      --header="[type]    name                     category     description" \
       --header-first \
       --reverse \
+      --disabled \
       --ansi \
       --no-mouse \
-      --preview='toolshed-preview {}' \
-      --preview-window='right,60%,border-left,wrap' \
-      --bind='ctrl-e:execute(toolshed-edit {})' \
-      --bind='ctrl-y:execute-silent(toolshed-yank {})' \
-      --bind='f3:execute(toolshed-view {})' \
-      --bind='ctrl-o:execute-silent(awk -F"\t" -v n="$(echo {} | awk "{print \$2}")" -v t="$(echo {} | awk "{print \$1}" | tr -d "[]")" "\$1==t && \$2==n {print \$3; exit}" '"$INDEX"' | tr -d "\n" | ${TOOLSHED_CLIP_CMD:-xclip -selection clipboard})')
+      --bind="change:reload(gt-color-filter {q} $INDEX)" \
+      --preview='gt-preview {}' \
+      --preview-window='right,45%,border-left,wrap' \
+      --bind='ctrl-e:execute(gt-edit {})' \
+      --bind='ctrl-y:execute-silent(gt-yank {})' \
+      --bind='f3:execute(gt-view {})' \
+      --bind='ctrl-o:execute-silent(awk -F"\t" -v n="$(echo {} | sed "s/\x1b\[[0-9;]*m//g" | awk "{print \$2}")" -v t="$(echo {} | sed "s/\x1b\[[0-9;]*m//g" | awk "{print \$1}" | tr -d "[]")" "\$1==t && \$2==n {print \$3; exit}" '"$INDEX"' | tr -d "\n" | xclip -selection clipboard)')
 
 [ -z "$selection" ] && exit 0
 
@@ -242,11 +287,39 @@ case "$sel_type" in
     ;;
   function)
     echo "=> function $sel_name (defined at $sel_path)"
-    echo "   already loaded via bashrc — just type '$sel_name' in any bash shell"
+    echo "   already loaded via /etc/bash.bashrc — just type '$sel_name' in any bash shell"
     ;;
   alias)
     echo "=> alias $sel_name (defined at $sel_path)"
     echo "   expands to: $sel_expansion"
     echo "   already loaded — just type '$sel_name' in any bash shell"
+    ;;
+  service)
+    echo "=> service $sel_name"
+    echo "   $sel_path"
+    # Show current status
+    if systemctl --user is-enabled "$sel_name" >/dev/null 2>&1; then
+      echo "   scope: user"
+      echo "   status: $(systemctl --user is-active "$sel_name" 2>/dev/null)"
+    elif systemctl is-enabled "$sel_name" >/dev/null 2>&1; then
+      echo "   scope: system"
+      echo "   status: $(systemctl is-active "$sel_name" 2>/dev/null)"
+    else
+      echo "   status: unknown"
+    fi
+    if [ -t 0 ] && [ -t 1 ]; then
+      read -rp "status / edit / quit? [s/e/Q] " ans
+      case "${ans,,}" in
+        s)
+          if [[ "$sel_path" == *"/user/"* ]]; then
+            systemctl --user status "$sel_name"
+          else
+            systemctl status "$sel_name"
+          fi
+          ;;
+        e) exec "${EDITOR:-nano}" "$sel_path" ;;
+        *) exit 0 ;;
+      esac
+    fi
     ;;
 esac

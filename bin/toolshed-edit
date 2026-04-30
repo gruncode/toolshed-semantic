@@ -1,13 +1,13 @@
 #!/bin/bash
-# Opens the selected toolshed catalog entry in $EDITOR, jumping to the correct line
-# Called by toolshed via Ctrl-E binding
-# Part of the toolshed catalog toolkit
+# Opens the selected gt catalog entry in the user's editor, jumping to the correct line for functions and aliases
+# Keywords: gt-edit, editor, open source, jump to line, edit script, edit function, fzf binding
+# gt-edit — open the file for an fzf row in $EDITOR
+# Called by gt via Ctrl-E binding
 
 set -u
 
-TOOLSHED_DIR="${TOOLSHED_DIR:-${HOME}/.local/share/toolshed}"
-INDEX="$TOOLSHED_DIR/index.tsv"
-row="${1:-}"
+INDEX="${HOME}/.local/share/mytools/index.tsv"
+row=$(printf '%s' "${1:-}" | sed 's/\x1b\[[0-9;]*m//g')
 [ -z "$row" ] && exit 0
 
 type=$(printf '%s' "$row" | awk '{print $1}' | tr -d '[]')
@@ -25,6 +25,7 @@ esac
 
 ED="${EDITOR:-nano}"
 if [ -n "$line" ]; then
+  # nano, vim, emacs, gedit all support +LINE for jump-to-line
   exec "$ED" "+${line}" "$file"
 else
   exec "$ED" "$file"

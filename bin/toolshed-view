@@ -1,12 +1,14 @@
 #!/bin/bash
-# Opens the full source of a catalog entry in a syntax-highlighted pager
-# Called from toolshed via F3 binding
-# Part of the toolshed catalog toolkit
+# Opens the full source of a gt catalog entry in a syntax-highlighted pager for reading
+# Keywords: gt-view, full pager, source reader, batcat, less, code viewer, read source, mouse select
+# gt-view — open the highlighted fzf row's file in a full-screen pager
+# Called from gt via F3 binding
+# Uses batcat (preferred, syntax-highlighted) or less as fallback
+# Inside the pager, terminal's native mouse selection works for copying
 
 set -u
 
-TOOLSHED_DIR="${TOOLSHED_DIR:-${HOME}/.local/share/toolshed}"
-INDEX="$TOOLSHED_DIR/index.tsv"
+INDEX="${HOME}/.local/share/mytools/index.tsv"
 row="${1:-}"
 [ -z "$row" ] && exit 0
 
@@ -32,20 +34,18 @@ if [ ! -r "$file" ]; then
   exit 0
 fi
 
-# Prefer batcat/bat (syntax highlight) — uses less internally for mouse selection
+# Prefer batcat (syntax highlight) — it uses less internally, so native mouse selection works
 if command -v batcat >/dev/null 2>&1; then
-  BAT=batcat
-elif command -v bat >/dev/null 2>&1; then
-  BAT=bat
-else
-  BAT=""
-fi
-
-if [ -n "$BAT" ]; then
   if [ -n "$line" ]; then
-    "$BAT" --paging=always --style=numbers,changes --highlight-line="$line" "$file"
+    batcat --paging=always --style=numbers,changes --highlight-line="$line" "$file"
   else
-    "$BAT" --paging=always --style=numbers,changes "$file"
+    batcat --paging=always --style=numbers,changes "$file"
+  fi
+elif command -v bat >/dev/null 2>&1; then
+  if [ -n "$line" ]; then
+    bat --paging=always --style=numbers,changes --highlight-line="$line" "$file"
+  else
+    bat --paging=always --style=numbers,changes "$file"
   fi
 else
   if [ -n "$line" ]; then

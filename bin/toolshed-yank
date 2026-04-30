@@ -1,43 +1,28 @@
 #!/bin/bash
-# Copies the selected tool's full source or definition to clipboard
-# Called from toolshed via Ctrl-Y binding
-# Supports X11 (xclip), Wayland (wl-copy), macOS (pbcopy), and tmux
-# Part of the toolshed catalog toolkit
+# Copies the selected tool's full source or definition to the X11 clipboard and primary selection
+# Keywords: gt-yank, clipboard, xclip, copy source, yank code, copy function, copy alias, X11 clipboard
+# gt-yank — copy the selected tool's source/definition to X11 CLIPBOARD + PRIMARY
+# Called from gt via Ctrl-Y binding
+# Scripts:   whole file
+# Functions: the function body (start line → next line that starts with '}' )
+# Aliases:   the single alias line
 
 set -u
 
-TOOLSHED_DIR="${TOOLSHED_DIR:-${HOME}/.local/share/toolshed}"
-INDEX="$TOOLSHED_DIR/index.tsv"
-row="${1:-}"
+INDEX="${HOME}/.local/share/mytools/index.tsv"
+row=$(printf '%s' "${1:-}" | sed 's/\x1b\[[0-9;]*m//g')
 [ -z "$row" ] && exit 0
 
-# Detect clipboard tool
-clip_copy() {
-  if command -v xclip >/dev/null 2>&1; then
-    xclip -selection clipboard < "$1" 2>/dev/null
-    xclip -selection primary   < "$1" 2>/dev/null
-  elif command -v wl-copy >/dev/null 2>&1; then
-    wl-copy < "$1" 2>/dev/null
-  elif command -v pbcopy >/dev/null 2>&1; then
-    pbcopy < "$1" 2>/dev/null
-  elif [ -n "${TMUX:-}" ]; then
-    tmux load-buffer "$1" 2>/dev/null
-  else
-    return 1
-  fi
-}
-
-notify() {
-  if command -v notify-send >/dev/null 2>&1; then
-    notify-send -t 2000 "toolshed-yank" "$1" 2>/dev/null
-  fi
-}
+if ! command -v xclip >/dev/null 2>&1; then
+  notify-send -t 2000 "gt-yank" "xclip not installed" 2>/dev/null || true
+  exit 1
+fi
 
 type=$(printf '%s' "$row" | awk '{print $1}' | tr -d '[]')
 name=$(printf '%s' "$row" | awk '{print $2}')
 rec=$(awk -F'\t' -v t="$type" -v n="$name" '$1==t && $2==n {print; exit}' "$INDEX")
 if [ -z "$rec" ]; then
-  notify "no record for $type/$name"
+  notify-send -t 2000 "gt-yank" "no record for $type/$name" 2>/dev/null || true
   exit 1
 fi
 
@@ -61,6 +46,7 @@ case "$type" in
     ;;
   function)
     if [ -r "$file" ] && [ -n "$line" ]; then
+      # copy from the function declaration line to the first lone closing brace
       awk -v start="$line" '
         NR==start { inside=1 }
         inside    { print }
@@ -78,11 +64,10 @@ case "$type" in
     ;;
 esac
 
-if clip_copy "$tmp"; then
-  bytes=$(wc -c < "$tmp")
-  lines=$(wc -l < "$tmp")
-  notify "copied $type $name ($lines lines, $bytes bytes)"
-else
-  notify "no clipboard tool found (install xclip, wl-copy, or pbcopy)"
-  exit 1
-fi
+# Copy to both CLIPBOARD (Ctrl-V) and PRIMARY (middle-click)
+xclip -selection clipboard < "$tmp" 2>/dev/null
+xclip -selection primary   < "$tmp" 2>/dev/null
+
+bytes=$(wc -c < "$tmp")
+lines=$(wc -l < "$tmp")
+notify-send -t 2000 "gt-yank" "copied $type $name ($lines lines, $bytes bytes)" 2>/dev/null || true

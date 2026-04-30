@@ -1,32 +1,26 @@
 #!/bin/bash
-# toolshed-discover — find commands you use but haven't cataloged
-# Scans bash history + optionally Claude Code sessions for uncataloged tools
-# Smart "not mine" detection: skips ELF, dpkg/rpm, pip, npm, snap binaries
+# Finds commands and MCP tools used in bash history and Claude sessions that are not yet in the gt catalog
+# Keywords: gt-discover, uncataloged commands, missing tools, history scan, MCP tools, catalog gap, command audit, discover
+# gt-discover — find commands you use but aren't in the gt catalog
+# Scans: ~/.bash_history + ~/.bash_history_claude + Claude session MCP calls
+# Fast: heavy lifting in Python, "not mine" detection via ELF/pip/npm/dpkg
 #
 # Usage:
-#   toolshed-discover [days]           show uncataloged commands (default: 30 days)
-#   toolshed-discover --ignore CMD     add CMD to permanent ignore list
-#   toolshed-discover --show-ignored   list ignored commands
-#
-# Part of the toolshed catalog toolkit
-# https://github.com/gruncode/toolshed-semantic
+#   gt-discover [days]           show uncataloged commands (default: 30 days)
+#   gt-discover --ignore CMD     add CMD to permanent ignore list
+#   gt-discover --show-ignored   list ignored commands
 
 set -u
 
-TOOLSHED_DIR="${TOOLSHED_DIR:-${HOME}/.local/share/toolshed}"
-TOOLSHED_CONFIG="${TOOLSHED_CONFIG:-${HOME}/.config/toolshed/config}"
-INDEX="$TOOLSHED_DIR/index.tsv"
-IGNORE_FILE="$TOOLSHED_DIR/discover-ignore.txt"
-
-# Load user config
-# shellcheck disable=SC1090
-[ -f "$TOOLSHED_CONFIG" ] && source "$TOOLSHED_CONFIG"
+MYTOOLS_DIR="${HOME}/.local/share/mytools"
+INDEX="$MYTOOLS_DIR/index.tsv"
+IGNORE_FILE="$MYTOOLS_DIR/discover-ignore.txt"
 
 # Handle --ignore and --show-ignored before Python
 case "${1:-}" in
   --ignore)
     shift
-    [ -z "${1:-}" ] && { echo "usage: toolshed-discover --ignore CMD [CMD ...]" >&2; exit 1; }
+    [ -z "${1:-}" ] && { echo "usage: gt-discover --ignore CMD [CMD ...]" >&2; exit 1; }
     touch "$IGNORE_FILE"
     for cmd in "$@"; do
       if grep -qxF "$cmd" "$IGNORE_FILE" 2>/dev/null; then
@@ -49,15 +43,15 @@ case "${1:-}" in
     ;;
   -h|--help)
     cat <<'EOF'
-toolshed-discover — find commands you use but aren't cataloged
+gt-discover — find commands you use but aren't in the gt catalog
 
 Usage:
-  toolshed-discover [days]           show uncataloged commands (default: 30 days)
-  toolshed-discover --ignore CMD     add CMD to permanent ignore list
-  toolshed-discover --show-ignored   list ignored commands
-  toolshed-discover --help           this help
+  gt-discover [days]           show uncataloged commands (default: 30 days)
+  gt-discover --ignore CMD     add CMD to permanent ignore list
+  gt-discover --show-ignored   list ignored commands
+  gt-discover --help           this help
 
-Ignore file: ~/.local/share/toolshed/discover-ignore.txt
+Ignore file: ~/.local/share/mytools/discover-ignore.txt
 EOF
     exit 0
     ;;
@@ -66,32 +60,28 @@ esac
 DAYS="${1:-30}"
 
 if [ ! -f "$INDEX" ]; then
-  echo "toolshed catalog not found — run toolshed-index first" >&2
+  echo "gt catalog not found — run gt-index first" >&2
   exit 1
 fi
 
-# Build list of history files to scan
-HIST_FILES="${HOME}/.bash_history"
-[ -n "${TOOLSHED_EXTRA_HISTORY:-}" ] && HIST_FILES="$HIST_FILES $TOOLSHED_EXTRA_HISTORY"
-
-# Claude sessions dir (optional)
-SESSIONS_DIR="${TOOLSHED_CLAUDE_SESSIONS:-}"
-
-exec python3 - "$INDEX" "$DAYS" "$IGNORE_FILE" "$HIST_FILES" "$SESSIONS_DIR" << 'PYEOF'
+exec python3 - "$INDEX" "$DAYS" "$IGNORE_FILE" << 'PYEOF'
 import os, sys, re, subprocess
 from collections import Counter
 
 INDEX = sys.argv[1]
 DAYS = int(sys.argv[2])
 IGNORE_FILE = sys.argv[3]
-HIST_FILES = sys.argv[4].split()
-SESSIONS_DIR = sys.argv[5] if len(sys.argv) > 5 else ""
 
-# ── 1. Load known commands from toolshed index ──
+HOME = os.path.expanduser("~")
+HIST_BASH = os.path.join(HOME, ".bash_history")
+HIST_CLAUDE = os.path.join(HOME, ".bash_history_claude")
+SESSIONS_DIR = os.path.join(HOME, ".claude/projects/-home-george")
+
+# ── 1. Load known commands from gt index ──
 known = set()
 known_mcp = set()
 with open(INDEX) as f:
-    next(f)
+    next(f)  # skip header
     for line in f:
         parts = line.rstrip("\n").split("\t")
         if len(parts) >= 2:
@@ -137,7 +127,7 @@ SKIP = {
     "cryptsetup", "openssl", "gpg", "xclip", "xsel", "xdotool", "xprop",
     "xwininfo", "wmctrl", "xrandr", "fzf", "batcat", "bat",
     "chgrp", "dd", "mktemp", "realpath", "basename", "dirname", "tput",
-    "strace", "ltrace", "rpm", "yum", "dnf", "pacman",
+    "strace", "ltrace",
 }
 SKIP.update(known)
 SKIP.update(ignored)
@@ -178,9 +168,8 @@ def extract_commands(histfile):
     return counts
 
 print("Scanning histories...", file=sys.stderr, flush=True)
-cmd_counts = Counter()
-for hf in HIST_FILES:
-    cmd_counts += extract_commands(hf)
+cmd_counts = extract_commands(HIST_BASH)
+cmd_counts += extract_commands(HIST_CLAUDE)
 
 # ── 4. Filter: resolve path, detect "not mine" ──
 candidates = {cmd: n for cmd, n in cmd_counts.items() if n >= 2}
@@ -224,7 +213,7 @@ for cmd, rpath in resolved.items():
     if "node_modules" in rpath or "/npm" in rpath or "/.npm" in rpath:
         not_mine.add(cmd)
 
-# Method 4: package-manager-owned
+# Method 4: dpkg-owned
 SYSTEM_DIRS = {"/usr/bin", "/usr/sbin", "/bin", "/sbin", "/usr/games"}
 for cmd, rpath in resolved.items():
     if cmd in not_mine:
@@ -233,21 +222,11 @@ for cmd, rpath in resolved.items():
     if parent in SYSTEM_DIRS:
         not_mine.add(cmd)
     elif "/usr/local/" not in rpath:
-        # Try dpkg (Debian/Ubuntu)
         try:
             r = subprocess.run(["dpkg", "-S", rpath], capture_output=True, timeout=5)
             if r.returncode == 0:
                 not_mine.add(cmd)
-                continue
-        except (FileNotFoundError, Exception):
-            pass
-        # Try rpm (RHEL/Fedora)
-        try:
-            r = subprocess.run(["rpm", "-qf", rpath], capture_output=True, timeout=5)
-            if r.returncode == 0:
-                not_mine.add(cmd)
-                continue
-        except (FileNotFoundError, Exception):
+        except Exception:
             pass
 
 # Method 5: snap/flatpak
@@ -257,6 +236,7 @@ for cmd, rpath in resolved.items():
 
 # ── 4c. Extract descriptions from script headers ──
 def extract_desc(filepath):
+    """Read first comment line from a script (same logic as gt-index)."""
     try:
         with open(filepath, errors="replace") as f:
             for i, line in enumerate(f):
@@ -270,6 +250,7 @@ def extract_desc(filepath):
                 m = re.match(r"^#\s*(.+)", stripped)
                 if m:
                     desc = m.group(1).strip()
+                    # Skip encoding/mode lines
                     if desc.startswith("-*-") or desc.startswith("vim:"):
                         continue
                     return desc[:80]
@@ -279,6 +260,7 @@ def extract_desc(filepath):
         pass
     return ""
 
+# Build results with descriptions
 bash_results = []
 for cmd, count in sorted(candidates.items(), key=lambda x: -x[1]):
     if cmd not in resolved:
@@ -288,14 +270,13 @@ for cmd, count in sorted(candidates.items(), key=lambda x: -x[1]):
     desc = extract_desc(resolved[cmd])
     bash_results.append((cmd, count, resolved[cmd], desc))
 
-# ── 5. Scan Claude sessions for MCP tool calls (optional) ──
-mcp_results = []
-if SESSIONS_DIR and os.path.isdir(SESSIONS_DIR):
-    print(f"Scanning Claude sessions (last {DAYS}d)...", file=sys.stderr, flush=True)
-    mcp_counts = Counter()
-    import time
-    cutoff = time.time() - DAYS * 86400
+# ── 5. Scan Claude sessions for MCP tool calls ──
+print(f"Scanning Claude sessions (last {DAYS}d)...", file=sys.stderr, flush=True)
+mcp_counts = Counter()
+import time
+cutoff = time.time() - DAYS * 86400
 
+if os.path.isdir(SESSIONS_DIR):
     for fname in os.listdir(SESSIONS_DIR):
         if not fname.endswith(".jsonl"):
             continue
@@ -316,29 +297,37 @@ if SESSIONS_DIR and os.path.isdir(SESSIONS_DIR):
         except Exception:
             pass
 
-    for tool, count in mcp_counts.most_common():
-        if tool in known_mcp or tool in ignored:
-            continue
-        skip = False
-        for k in known:
-            if tool.endswith("__" + k.replace("/", "__")):
-                skip = True
-                break
-        if skip:
-            continue
-        mcp_results.append((tool, count))
+# Filter MCP: remove known + ignored
+mcp_results = []
+for tool, count in mcp_counts.most_common():
+    if tool in known_mcp or tool in ignored:
+        continue
+    skip = False
+    for k in known:
+        if tool.endswith("__" + k.replace("/", "__")):
+            skip = True
+            break
+    if skip:
+        continue
+    mcp_results.append((tool, count))
 
 # ── 5b. Make MCP tool names human-readable ──
 def humanize_mcp(name):
+    """mcp__voicemode__converse → voicemode/converse
+       mcp__claude_ai_Gmail__gmail_search → Gmail/gmail_search (cloud)
+       mcp__plugin_playwright_playwright__browser_click → playwright/browser_click (plugin)"""
     n = name
     if n.startswith("mcp__"):
         n = n[5:]
+    # Cloud plugins: claude_ai_ServiceName__tool_name
     m = re.match(r"claude_ai_([^_]+(?:_[^_]+)*)__(.+)", n)
     if m:
         return f"{m.group(1)}/{m.group(2)}", "cloud"
+    # Installed plugins: plugin_X_Y__tool_name
     m = re.match(r"plugin_[^_]+_([^_]+)__(.+)", n)
     if m:
         return f"{m.group(1)}/{m.group(2)}", "plugin"
+    # Local servers: servername__tool_name
     parts = n.split("__", 1)
     if len(parts) == 2:
         return f"{parts[0]}/{parts[1]}", "local"
@@ -348,7 +337,7 @@ def humanize_mcp(name):
 found = 0
 
 if bash_results:
-    print(f"\nCommands used but not in toolshed catalog:")
+    print(f"\nCommands used but not in gt catalog:")
     print("─" * 72)
     for cmd, count, path, desc in bash_results:
         line = f"  {cmd:<24s} {count:>4}x  {path}"
@@ -359,7 +348,7 @@ if bash_results:
     print()
 
 if mcp_results:
-    print(f"MCP tools used in Claude but not in toolshed (last {DAYS}d):")
+    print(f"MCP tools used in Claude but not in gt (last {DAYS}d):")
     print("─" * 72)
     for tool, count in mcp_results:
         human, kind = humanize_mcp(tool)
@@ -369,9 +358,9 @@ if mcp_results:
     print()
 
 if found == 0:
-    print("\nAll commands and MCP tools you use are already cataloged. ✓")
+    print("\nAll commands and MCP tools you use are already in gt. ✓")
 else:
     print(f"Found {found} uncataloged items.")
-    print("To ignore:  toolshed-discover --ignore <name>")
-    print("To catalog: add scripts to a scanned dir, then toolshed-index")
+    print("To ignore:  gt-discover --ignore <name>")
+    print("To catalog: symlink into ~/bin or ~/.local/share/mcp/, then gt-index")
 PYEOF
