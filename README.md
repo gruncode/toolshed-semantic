@@ -8,9 +8,10 @@ If you have dozens of scripts, aliases, and functions scattered across your syst
 
 Unlike snippet managers (navi, pet) that require manual curation, toolshed **scans your system automatically**:
 
-- **Auto-scans** your bin dirs, bashrc aliases, shell functions, MCP servers
+- **Auto-scans** your bin dirs, bashrc aliases, shell functions, MCP servers, systemd user services
+- **Auto-descriptions** — reads the first `# comment` and `# Keywords:` from each script header; no manual tagging needed
 - **Fuzzy picker** (fzf) with syntax-highlighted preview, editor jumping, clipboard yank
-- **Semantic search** — find tools by meaning, not just name (`toolshed --ask "connect to remote machine"` finds SSH aliases)
+- **Semantic search** — describe what a tool *does* in plain English and find it even if the name doesn't match (`toolshed --ask "connect to remote machine"` finds SSH aliases, autossh tunnels, sshfs mounts)
 - **Discover mode** — finds commands you *use* but haven't *cataloged* (scans bash history)
 - **"Not mine" detection** — automatically skips system packages, ELF binaries, pip/npm-installed tools
 - **MCP-aware** — indexes Model Context Protocol servers and tools (for Claude Code / AI-assisted workflows)
@@ -34,7 +35,7 @@ toolshed
 ```
 toolshed                      # interactive fuzzy picker
 toolshed <query>              # filter, auto-pick if unique
-toolshed --ask "description"  # semantic search (requires setup)
+toolshed --ask "description"  # semantic search — find by meaning, not name
 toolshed --list               # plain table
 toolshed --list <category>    # filter by category
 toolshed --cats               # show categories with counts
@@ -70,15 +71,29 @@ Scans these locations (configurable):
 |--------|---------------|
 | `/usr/local/bin`, `~/bin`, `~/.local/bin`, `~/scripts` | Your scripts |
 | `/etc/bash.bashrc`, `~/.bashrc` | Functions and aliases |
+| `~/.config/systemd/user/*.service` | Systemd user services |
 | `~/.local/share/mcp/*/` | MCP servers and `@mcp.tool` functions |
 | `~/.mcp.json`, `~/.claude/mcp.json` | Additional MCP server paths |
 | Claude Code session logs (opt-in) | Cloud/plugin MCP tools seen in use |
-| `~/.claude/commands/*.md` (opt-in) | Claude Code slash commands |
+| `~/.claude/commands/*.md` (opt-in) | Claude Code slash commands / skills |
 
-Outputs:
-- `~/.local/share/toolshed/index.tsv` — structured catalog (TSV)
-- `~/.local/share/toolshed/CMDLIST.md` — human-readable grouped list
-- `~/.local/share/toolshed/embeddings.npz` — vector cache (if semantic search enabled)
+#### Auto-description extraction
+
+toolshed-index reads descriptions directly from your script headers — **no manual tagging required**:
+
+```bash
+#!/bin/bash
+# Sync local project to remote server over rsync      ← used as description
+# Keywords: sync, deploy, rsync, remote, upload       ← used for search & embeddings
+
+# ... rest of script
+```
+
+- **Line 1 `#!`** — shebang, skipped
+- **Line 2+ first `# text`** — becomes the catalog description
+- **`# Keywords: ...`** — comma-separated tags; merged into the description text for richer search
+
+This means running `toolshed-index` is enough — the catalog is self-documenting as long as your scripts have a comment on line 2.
 
 ### "Not mine" detection
 
@@ -104,19 +119,34 @@ This is the "command archaeologist" — it digs up tools you've forgotten about.
 
 ## Semantic search (optional)
 
-`toolshed --ask` uses vector embeddings for meaning-based search, not just keyword matching.
+`toolshed --ask` finds tools **by meaning**, not by name or keyword match.
+
+> You forgot the name of your SSH tunnel helper. Try: `toolshed --ask "persistent reverse tunnel"` — it finds it even if the word "tunnel" never appears in the script name.
 
 ### How it works
 
 1. **Indexing:** `toolshed-index` sends each tool's name + description to [Cohere's Embed API](https://cohere.com/embed)
 2. **Vectorization:** Each entry becomes a 1024-dimensional vector capturing its semantic meaning
-3. **Caching:** Vectors are saved locally in `~/.local/share/toolshed/embeddings.npz` (a compressed NumPy file)
+3. **Caching:** Vectors are saved locally in `~/.local/share/toolshed/embeddings.npz` — no repeated API calls
 4. **Searching:** When you run `--ask "your query"`, the query is embedded into the same vector space
-5. **Ranking:** Results are ranked by cosine similarity (dot product of normalized vectors) — the closer two vectors are, the more semantically similar
+5. **Ranking:** Results are ranked by cosine similarity — the closer two vectors are, the more semantically similar
 
 ### Why this matters
 
-Regular fuzzy search matches characters: `ssh` finds things named "ssh". Semantic search matches *meaning*: `"connect to remote machine"` finds SSH aliases, autossh tunnels, and sshfs mount commands — even if "remote" or "connect" don't appear in their names.
+Regular fuzzy search matches characters: `ssh` finds things named "ssh". Semantic search matches *meaning*:
+
+```bash
+toolshed --ask "connect to remote machine"
+# → finds SSH aliases, autossh tunnels, sshfs mounts — even if "remote" or "connect" are absent
+
+toolshed --ask "monitor system resources"
+# → finds htop wrappers, custom top scripts, resource dashboards
+
+toolshed --ask "read news aloud"
+# → finds TTS + RSS scripts even if they're named something cryptic
+```
+
+The quality of semantic search scales with description quality. If your script has a good `# comment` header (see [auto-description extraction](#auto-description-extraction)), semantic search works out of the box.
 
 ### Setup
 
@@ -200,8 +230,9 @@ See `config.example` for all options with documentation.
 | Feature | toolshed | navi | pet | Atuin |
 |---------|----------|------|-----|-------|
 | Auto-scan bin/aliases/functions | **yes** | no | no | no |
+| Auto-extract descriptions from headers | **yes** | no | no | no |
 | Fuzzy picker with preview | **yes** | yes | yes | partial |
-| Semantic/NL search | **yes** | no | no | no |
+| Semantic/NL search (`--ask`) | **yes** | no | no | no |
 | Discover uncataloged commands | **yes** | no | no | no |
 | "Not mine" detection | **yes** | no | no | no |
 | MCP server awareness | **yes** | no | no | no |
