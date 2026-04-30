@@ -1,7 +1,7 @@
 #!/bin/bash
 # Scans user bin dirs and bashrc to build the gt tool catalog index (index.tsv, CMDLIST.md, embeddings)
 # Keywords: gt-index, catalog builder, index generator, tool scanner, script inventory, command list, embeddings, mytools, reindex, refresh
-# gt-index — catalog george's user-authored commands
+# toolshed-index — catalog your user-authored commands
 # Scans bin dirs + /etc/bash.bashrc + ~/.bashrc, writes index.tsv and CMDLIST.md
 # Regenerate anytime: `gt-index`
 # Part of the `gt` catalog toolkit (see also: `gt`)
@@ -37,30 +37,31 @@ mkdir -p "$MYTOOLS_DIR"
 # --------- helper: infer category from command name ---------
 category_for() {
   case "$1" in
-    dsearch|search-ai-10agents|dsearch-deddie|split-query-recoll-vector-answer|recoll-search|docfetcher-search|faiss-search|his|hiso) echo search ;;
+    dsearch|search-ai-*|split-query-*|recoll-search|docfetcher-search|faiss-search|his|hiso) echo search ;;
     lo|gf|gfr|gfd|losed|hi|rfind|ftx|showapt|showhistT|als|xstat) echo search ;;
     claude-*|store_claude_hist|extract-dead-context|explain-with-claude.sh|explain-with-codex.sh) echo claude ;;
     chrome-*|firefox-*) echo browser ;;
-    fb-*|nbg-*|scrape*|crawl*|cdp-*) echo web-auto ;;
+    scrape-*|scrape*|crawl*|cdp-*|web-auto-*) echo web-auto ;;
     copyq-*) echo clipboard ;;
     clip-sync-*|clipboard-*) echo clipboard ;;
-    vnc-*|vbox-*|virtualbox-*|start-espvm-*|start-vm-*|monitor-vm-*) echo virt ;;
+    vnc-*|vbox-*|virtualbox-*|start-vm-*|monitor-vm-*) echo virt ;;
     pl|plc|pld) echo logs ;;
     backup-*) echo backup ;;
-    herback|routerherback) echo network ;;
+    *back|*backup) echo network ;;
     speak|readaloud) echo tts ;;
     gt|gt-index|gt-edit|gt-preview) echo catalog ;;
     gt-ai-*|gt-codex-*) echo ai-mcp ;;
-    gt-megaron-*) echo misc ;;
+    gt-custom-*) echo misc ;;
     gt-*) echo ai-mcp ;;
     cline|codex|firecrawl) echo ai-mcp ;;
     oomd-notify*) echo system ;;
     rm|nemo|cl|xfce4-terminal*) echo wrapper ;;
     heavy-run|fix-audio*|test-vaapi*|set-gaming-*|claude-voice) echo system ;;
     grep|lsa|gps|dmesg|ls|vgl|pyenv) echo general ;;
-    d7070|d7050|her|herl|g40|g560*|bzone|amilo|hraspi|iotoci|routerath|routerher|ttower|traspi|espvm|g40lan|usbdebianvnc|rpi4*|prpi4|d7070VM|janusvm|zmherl|zmd7050|fr7050|frp7050|gd7070|gd7050|gherl|gg40|gg560*|gzone|gamilo|hpraspi|gher|gespvm) echo ssh ;;
-    gd7070@g|gd7050@g|g40@g|g560@g|bzone@g|amilo@g|hraspi@g|gg40@g|gg560@g|gzone@g|gamilo@g|d7070@g|d7050@g) echo ssh-gw ;;
-    mountDATALINUX|u*|m[rg]*) echo mount ;;
+    # Add your SSH host aliases here, or use TOOLSHED_CATEGORIES_FILE in config
+    # myserver|myrpi|mynas) echo ssh ;;
+    # myserver@gw) echo ssh-gw ;;
+    mount-*|u*|m[rg]*) echo mount ;;
     *) echo misc ;;
   esac
 }
@@ -369,7 +370,7 @@ for server_dir in "${MCP_DIRS[@]}"; do
 done
 # --------- discover cloud/plugin MCP tools from Claude session logs ---------
 # These tools have no local code but are used via Claude (Gmail, GCal, Brightdata, etc.)
-SESSIONS_DIR="${HOME}/.claude/projects/-home-george"
+SESSIONS_DIR="${TOOLSHED_CLAUDE_SESSIONS:-$(ls -d "${HOME}/.claude/projects/"*/ 2>/dev/null | head -1)}"
 if [ -d "$SESSIONS_DIR" ]; then
   # Collect already-known mcp-tool names to skip
   declare -A known_mcp_tools
@@ -476,7 +477,7 @@ cp "$TMP_TSV" "$INDEX"
 chmod 644 "$INDEX"
 
 {
-  echo "# george's tool catalog"
+  echo "# $(whoami)'s tool catalog"
   echo
   echo "_Generated $(date '+%Y-%m-%d %H:%M:%S') by \`gt-index\` on $(hostname)_"
   echo

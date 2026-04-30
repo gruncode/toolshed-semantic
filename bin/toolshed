@@ -1,7 +1,7 @@
 #!/bin/bash
 # Interactive fuzzy picker for browsing, searching, and launching user-written scripts, functions, and aliases
 # Keywords: gt, tool catalog, fuzzy finder, fzf picker, command browser, script launcher, alias lookup, semantic search, Cohere embed, mytools
-# gt — fuzzy picker for george's tool catalog
+# gt — fuzzy picker for your tool catalog
 # Reads ~/.local/share/mytools/index.tsv (built by gt-index)
 # Uses fzf + bat/batcat for preview; falls back to select menu if fzf missing
 # Part of the `gt` catalog toolkit (see also: `gt-index`)
@@ -49,7 +49,7 @@ Categories: browser  web-auto  search  claude  ai-mcp  clipboard  audio
   gt --list web-auto
 
   # Natural language: find a tool by describing what it does
-  gt --ask "scrape facebook events"
+  gt --ask "scrape web events"
   gt --ask "change prices on website"
   gt --ask "download emails from outlook"
   gt --ask "search my documents semantically"
@@ -59,18 +59,18 @@ Categories: browser  web-auto  search  claude  ai-mcp  clipboard  audio
   gt --list browser
 
   # Quick keyword filter (non-interactive, prints if unique match)
-  gt fb-scrape
-  gt nbg
+  gt deploy
+  gt backup
   gt chrome-vnc
 
   # Open script in editor directly
   gt chrome-cdp   → then press Ctrl-E
 
   # Copy path to clipboard
-  gt fb-scrape    → then press Ctrl-O
+  gt myscraper    → then press Ctrl-O
 
   # View full script without running it
-  gt crawl        → then press F3
+  gt backup       → then press F3
 
 ── WEB AUTOMATION QUICK REFERENCE ───────────────────────────────────────
 
@@ -92,9 +92,9 @@ Categories: browser  web-auto  search  claude  ai-mcp  clipboard  audio
         # ArrowDown:   page.keyboard.press('ArrowDown')  # for Outlook-like lists
 
   Scripts:
-    fb-scrape-events.py   — Facebook events (Selenium + cloned FF profile)
-    nbg-session.py        — NBG bank interactive session
-    crawl_redownloadGOOD.py — Outlook email bulk download (ArrowDown method)
+    scrape-events.py      — Web scraping with Selenium + browser profile
+    bank-session.py       — Bank/portal interactive session (form automation)
+    bulk-download.py      — Bulk email/list download (keyboard navigation method)
     chrome-cdp            — Launch Chrome with CDP port 9222 (permanent profile)
 
 ── PICKER KEYS ───────────────────────────────────────────────────────────

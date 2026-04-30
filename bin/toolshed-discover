@@ -75,7 +75,13 @@ IGNORE_FILE = sys.argv[3]
 HOME = os.path.expanduser("~")
 HIST_BASH = os.path.join(HOME, ".bash_history")
 HIST_CLAUDE = os.path.join(HOME, ".bash_history_claude")
-SESSIONS_DIR = os.path.join(HOME, ".claude/projects/-home-george")
+_sessions_env = os.environ.get("TOOLSHED_CLAUDE_SESSIONS", "")
+SESSIONS_DIR = _sessions_env if _sessions_env else next(
+    iter(sorted(
+        (p for p in __import__('glob').glob(os.path.join(HOME, ".claude/projects/*/")) if os.path.isdir(p)),
+        reverse=True
+    )), ""
+)
 
 # ── 1. Load known commands from gt index ──
 known = set()
